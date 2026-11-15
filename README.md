@@ -1,3 +1,6 @@
+#Live Demo:
+Link: https://inkloomguard-ai.onrender.com/
+
 # InkloomGuard AI
 
 **InkloomGuard AI** is a multi-tenant, AI-assisted brand compliance and governance platform built with TypeScript, Express, React, Vite, **Supabase PostgreSQL** (`pg`, with local `node:sqlite` dev fallback), **Supabase Private Storage**, and the Google Gemini API (`@google/genai`). It enables organizations to manage brand profiles, upload and extract structured brand compliance rules, audit copy, documents, and visual assets across eight compliance dimensions, iterate on revisions, and enforce role-based human approval workflows.
