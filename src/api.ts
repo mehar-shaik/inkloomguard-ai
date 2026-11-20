@@ -75,6 +75,20 @@ export interface AuthResponse {
   verificationEmailError?: string;
 }
 
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+  reason?: string;
+
+  constructor(message: string, status: number, code?: string, reason?: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.reason = reason;
+  }
+}
+
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const isFormData = options.body instanceof FormData;
   const token = getAuthToken();
@@ -108,6 +122,8 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   if (!res.ok) {
     const message =
       (typeof data.error === 'string' && data.error) || `Request failed (${res.status})`;
+    const code = typeof data.code === 'string' ? data.code : undefined;
+    const reason = typeof data.reason === 'string' ? data.reason : undefined;
     const isAuthAttempt =
       url.startsWith('/api/auth/login') ||
       url.startsWith('/api/auth/register') ||
@@ -118,7 +134,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
         unauthorizedHandler(message);
       }
     }
-    throw new Error(message);
+    throw new ApiError(message, res.status, code, reason);
   }
   return data as T;
 }
@@ -208,11 +224,13 @@ export const api = {
         body: JSON.stringify({ token }),
       }
     ),
-  resendVerification: (email?: string) =>
-    request<{ ok: boolean; message: string }>('/api/auth/resend-verification', {
+  resendVerification: (email?: string) => {
+    const trimmed = email?.trim();
+    return request<{ ok: boolean; message: string }>('/api/auth/resend-verification', {
       method: 'POST',
-      body: JSON.stringify(email ? { email } : {}),
-    }),
+      body: JSON.stringify(trimmed ? { email: trimmed } : {}),
+    });
+  },
   changePassword: (payload: {
     currentPassword: string;
     newPassword: string;

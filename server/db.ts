@@ -192,8 +192,15 @@ export function isProductionEnvironment(): boolean {
   return process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
 }
 
-const databaseUrl = process.env.DATABASE_URL?.trim();
+const rawDatabaseUrl = process.env.DATABASE_URL?.trim();
 const isProductionRuntime = isProductionEnvironment();
+const isPlaceholderDatabaseUrl =
+  !isProductionRuntime &&
+  Boolean(
+    rawDatabaseUrl &&
+      (/YOUR_PROJECT_REF/i.test(rawDatabaseUrl) || /YOUR_DB_PASSWORD/i.test(rawDatabaseUrl))
+  );
+const databaseUrl = isPlaceholderDatabaseUrl ? '' : rawDatabaseUrl;
 
 if (isProductionRuntime && !databaseUrl) {
   throw new Error(

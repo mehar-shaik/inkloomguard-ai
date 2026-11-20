@@ -5,6 +5,7 @@ import {
   LogOut,
   MailCheck,
   MailWarning,
+  RefreshCw,
   Send,
   ShieldCheck,
 } from 'lucide-react';
@@ -21,12 +22,14 @@ export function SettingsPage({
   theme,
   onToggleTheme,
   onUserUpdated,
+  onRefreshUser,
   onSignedOutAll,
 }: {
   user: AuthUser;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
   onUserUpdated: (user: AuthUser) => void;
+  onRefreshUser?: () => Promise<AuthUser | null>;
   onSignedOutAll: () => void;
 }) {
   const [currentPassword, setCurrentPassword] = useState('');
@@ -37,6 +40,7 @@ export function SettingsPage({
   const [passwordSuccess, setPasswordSuccess] = useState('');
 
   const [resendingVerify, setResendingVerify] = useState(false);
+  const [refreshingVerify, setRefreshingVerify] = useState(false);
   const [verifyNotice, setVerifyNotice] = useState('');
   const [verifyError, setVerifyError] = useState('');
 
@@ -102,6 +106,25 @@ export function SettingsPage({
       setVerifyError(err instanceof Error ? err.message : 'Unable to send verification email.');
     } finally {
       setResendingVerify(false);
+    }
+  }
+
+  async function handleRefreshVerificationStatus() {
+    if (!onRefreshUser) return;
+    setVerifyNotice('');
+    setVerifyError('');
+    setRefreshingVerify(true);
+    try {
+      const latest = await onRefreshUser();
+      if (latest?.emailVerified) {
+        setVerifyNotice('Your email address is verified and workspace access is active.');
+      } else {
+        setVerifyNotice('Email verification is still pending. Please check your inbox and spam folder, or resend the link.');
+      }
+    } catch (err) {
+      setVerifyError(err instanceof Error ? err.message : 'Unable to refresh verification status.');
+    } finally {
+      setRefreshingVerify(false);
     }
   }
 
@@ -186,18 +209,31 @@ export function SettingsPage({
                 Verify your email address
               </p>
               <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-                Confirm ownership of <span className="font-semibold">{user.email}</span> to enable full recovery and security confirmations.
+                Confirm ownership of <span className="font-semibold">{user.email}</span> to enable full workspace access, password recovery, and security confirmations.
               </p>
             </div>
-            <button
-              type="button"
-              onClick={handleResendVerification}
-              disabled={resendingVerify}
-              className="clay-btn-primary rounded-full px-5 py-2.5 text-xs font-bold inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer disabled:opacity-60"
-            >
-              <Send className="w-3.5 h-3.5" />
-              {resendingVerify ? 'Sending...' : 'Resend Verification Email'}
-            </button>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {onRefreshUser && (
+                <button
+                  type="button"
+                  onClick={handleRefreshVerificationStatus}
+                  disabled={refreshingVerify}
+                  className="clay-btn-secondary rounded-full px-4 py-2.5 text-xs font-bold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${refreshingVerify ? 'animate-spin' : ''}`} />
+                  {refreshingVerify ? 'Checking...' : 'Check Status'}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleResendVerification}
+                disabled={resendingVerify}
+                className="clay-btn-primary rounded-full px-5 py-2.5 text-xs font-bold inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+              >
+                <Send className="w-3.5 h-3.5" />
+                {resendingVerify ? 'Sending...' : 'Resend Verification Email'}
+              </button>
+            </div>
           </div>
         )}
 
@@ -232,6 +268,15 @@ export function SettingsPage({
             Updating your password rotates your session token and automatically signs out all other active devices.
           </p>
         </div>
+
+        {user.verificationRequired && !user.emailVerified && (
+          <div
+            role="status"
+            className="rounded-2xl px-4 py-3 text-xs font-semibold bg-amber-50 text-amber-900 border border-amber-200 dark:bg-amber-500/15 dark:text-amber-200 dark:border-amber-400/30"
+          >
+            Please verify your email address above before changing your password.
+          </div>
+        )}
 
         <form onSubmit={handleChangePassword} className="space-y-4 max-w-xl">
           <PasswordField

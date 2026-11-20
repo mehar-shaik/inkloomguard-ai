@@ -580,8 +580,8 @@ export async function inspectPasswordResetToken(
   | { valid: true; userId: number; companyId: number }
   | { valid: false; reason: 'invalid' | 'used' | 'expired'; error: string }
 > {
-  const token = String(rawToken || '').trim();
-  if (!/^[a-f0-9]{64}$/i.test(token)) {
+  const token = String(rawToken || '').trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(token)) {
     return { valid: false, reason: 'invalid', error: 'This password reset link is invalid.' };
   }
 
@@ -635,8 +635,8 @@ export async function resetPasswordWithToken(params: {
   rawToken: string;
   newPassword: string;
 }): Promise<{ user: AuthUser; changedAtIso: string }> {
-  const token = String(params.rawToken || '').trim();
-  if (!/^[a-f0-9]{64}$/i.test(token)) {
+  const token = String(params.rawToken || '').trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(token)) {
     throw new Error('This password reset link is invalid.');
   }
 
@@ -793,8 +793,8 @@ export async function verifyEmailWithToken(rawToken: string): Promise<
   | { verified: true; user: AuthUser }
   | { verified: false; reason: 'invalid' | 'used' | 'expired' | 'already_verified'; error: string }
 > {
-  const token = String(rawToken || '').trim();
-  if (!/^[a-f0-9]{64}$/i.test(token)) {
+  const token = String(rawToken || '').trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(token)) {
     return { verified: false, reason: 'invalid', error: 'This verification link is invalid.' };
   }
 

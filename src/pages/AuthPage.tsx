@@ -19,7 +19,7 @@ export function AuthPage({
     meta?: { verificationEmailSent?: boolean; verificationEmailError?: string }
   ) => Promise<void>;
   onForgotPassword: () => void;
-  onResendVerification: () => void;
+  onResendVerification: (email?: string) => void;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
   sessionNotice?: string;
@@ -286,7 +286,7 @@ export function AuthPage({
                 <div className="flex items-center justify-between pt-0.5">
                   <button
                     type="button"
-                    onClick={onResendVerification}
+                    onClick={() => onResendVerification(email.trim())}
                     className="text-xs font-semibold text-slate-500 hover:text-indigo-600 dark:text-slate-400 dark:hover:text-violet-300 cursor-pointer"
                   >
                     Resend verification email

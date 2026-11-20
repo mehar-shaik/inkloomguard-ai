@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ArrowRight,
@@ -8,7 +8,7 @@ import {
   Send,
   ShieldAlert,
 } from 'lucide-react';
-import { api } from '../api';
+import { ApiError, api } from '../api';
 import { ThemeToggle } from '../components/ClayUI';
 import shieldEmblem from '/src/assets/images/inkloom_shield_emblem_1794725371250.jpg';
 
@@ -16,6 +16,8 @@ export function VerifyEmailPage({
   token,
   isAuthenticated,
   userEmail,
+  userEmailVerified,
+  initialEmail,
   theme,
   onToggleTheme,
   onVerifiedRefresh,
@@ -24,34 +26,45 @@ export function VerifyEmailPage({
   token: string;
   isAuthenticated: boolean;
   userEmail?: string;
+  userEmailVerified?: boolean;
+  initialEmail?: string;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
   onVerifiedRefresh?: () => Promise<void>;
   onBackToApp: () => void;
 }) {
-  const [verifying, setVerifying] = useState(Boolean(token));
-  const [status, setStatus] = useState<'idle' | 'verified' | 'error'>('idle');
+  const [verifying, setVerifying] = useState(Boolean(token.trim()));
+  const [status, setStatus] = useState<'idle' | 'verified' | 'already_verified' | 'error'>('idle');
   const [statusMessage, setStatusMessage] = useState('');
 
-  const [resendEmail, setResendEmail] = useState(userEmail || '');
+  const defaultEmail = initialEmail?.trim() || (!userEmailVerified ? userEmail || '' : '');
+  const [resendEmail, setResendEmail] = useState(defaultEmail);
   const [resending, setResending] = useState(false);
   const [resendMessage, setResendMessage] = useState('');
   const [resendError, setResendError] = useState('');
 
+  const lastVerifiedTokenRef = useRef<string>('');
+
   useEffect(() => {
-    let active = true;
-    if (!token.trim()) {
+    const cleanToken = token.trim();
+    if (!cleanToken) {
       setVerifying(false);
       setStatus('idle');
       return;
     }
 
+    if (lastVerifiedTokenRef.current === cleanToken) {
+      return;
+    }
+    lastVerifiedTokenRef.current = cleanToken;
+
+    let active = true;
     setVerifying(true);
     setStatus('idle');
     setStatusMessage('');
 
     api
-      .verifyEmail(token)
+      .verifyEmail(cleanToken)
       .then(async (res) => {
         if (!active) return;
         setStatus('verified');
@@ -60,8 +73,16 @@ export function VerifyEmailPage({
           await onVerifiedRefresh().catch(() => {});
         }
       })
-      .catch((err) => {
+      .catch(async (err) => {
         if (!active) return;
+        if (err instanceof ApiError && err.reason === 'already_verified') {
+          setStatus('already_verified');
+          setStatusMessage(err.message || 'This email address has already been verified.');
+          if (isAuthenticated && onVerifiedRefresh) {
+            await onVerifiedRefresh().catch(() => {});
+          }
+          return;
+        }
         setStatus('error');
         setStatusMessage(
           err instanceof Error ? err.message : 'This email verification link is invalid or expired.'
@@ -74,15 +95,29 @@ export function VerifyEmailPage({
     return () => {
       active = false;
     };
-  }, [token]);
+  }, [token, isAuthenticated, onVerifiedRefresh]);
 
   async function handleResend(e: React.FormEvent) {
     e.preventDefault();
     setResendMessage('');
     setResendError('');
+
+    const enteredEmail = resendEmail.trim();
+    if (!enteredEmail && !isAuthenticated) {
+      setResendError('Please enter your account email address.');
+      return;
+    }
+
     setResending(true);
     try {
-      const res = await api.resendVerification(isAuthenticated ? undefined : resendEmail.trim());
+      const sameAsAuthed =
+        isAuthenticated &&
+        Boolean(userEmail) &&
+        enteredEmail.toLowerCase() === String(userEmail).trim().toLowerCase();
+
+      const res = await api.resendVerification(
+        isAuthenticated && (!enteredEmail || sameAsAuthed) ? undefined : enteredEmail
+      );
       setResendMessage(res.message);
     } catch (err) {
       setResendError(err instanceof Error ? err.message : 'Unable to resend verification email.');
@@ -90,6 +125,8 @@ export function VerifyEmailPage({
       setResending(false);
     }
   }
+
+  const isSuccessOutcome = status === 'verified' || status === 'already_verified';
 
   return (
     <div className="min-h-screen flex flex-col justify-between p-4 sm:p-8 relative overflow-hidden">
@@ -135,7 +172,7 @@ export function VerifyEmailPage({
             </div>
           )}
 
-          {!verifying && status === 'verified' && (
+          {!verifying && isSuccessOutcome && (
             <div className="space-y-5">
               <div
                 role="status"
@@ -143,7 +180,9 @@ export function VerifyEmailPage({
               >
                 <CheckCircle2 className="w-5 h-5 text-emerald-600 dark:text-emerald-300 shrink-0 mt-0.5" />
                 <div className="space-y-1 text-xs leading-relaxed">
-                  <p className="font-bold text-slate-900 dark:text-white">Verification Complete</p>
+                  <p className="font-bold text-slate-900 dark:text-white">
+                    {status === 'already_verified' ? 'Email Already Verified' : 'Verification Complete'}
+                  </p>
                   <p className="text-slate-600 dark:text-slate-300">{statusMessage}</p>
                 </div>
               </div>
@@ -172,34 +211,32 @@ export function VerifyEmailPage({
             </div>
           )}
 
-          {!verifying && status !== 'verified' && (
+          {!verifying && !isSuccessOutcome && (
             <form onSubmit={handleResend} className="space-y-4 pt-2 border-t border-slate-200/70 dark:border-violet-400/20">
-              <p className="text-xs font-semibold text-slate-600 dark:text-slate-300">
-                Need a fresh verification link? Send a new verification email below.
+              <p className="text-xs font-semibold text-slate-600 dark:text-slate-300 leading-relaxed">
+                Need a fresh verification link? Enter your account email below to send a new 24-hour verification link. Check your inbox and spam folder after sending.
               </p>
 
-              {!isAuthenticated && (
-                <div>
-                  <label
-                    htmlFor="resend-verify-email"
-                    className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5"
-                  >
-                    Account Email
-                  </label>
-                  <div className="relative">
-                    <Mail className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
-                    <input
-                      id="resend-verify-email"
-                      type="email"
-                      required
-                      value={resendEmail}
-                      onChange={(e) => setResendEmail(e.target.value)}
-                      placeholder="name@company.com"
-                      className="clay-well w-full rounded-2xl pl-11 pr-4 py-3 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
-                    />
-                  </div>
+              <div>
+                <label
+                  htmlFor="resend-verify-email"
+                  className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5"
+                >
+                  Account Email
+                </label>
+                <div className="relative">
+                  <Mail className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    id="resend-verify-email"
+                    type="email"
+                    required={!isAuthenticated || Boolean(userEmailVerified)}
+                    value={resendEmail}
+                    onChange={(e) => setResendEmail(e.target.value)}
+                    placeholder={userEmail || 'name@company.com'}
+                    className="clay-well w-full rounded-2xl pl-11 pr-4 py-3 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
+                  />
                 </div>
-              )}
+              </div>
 
               {resendMessage && (
                 <div

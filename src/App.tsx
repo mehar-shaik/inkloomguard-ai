@@ -13,6 +13,7 @@ import {
   Menu,
   X,
   MailWarning,
+  RefreshCw,
   Send,
 } from 'lucide-react';
 import {
@@ -57,7 +58,7 @@ type PublicAuthView =
   | { view: 'auth' }
   | { view: 'forgot-password' }
   | { view: 'reset-password'; token: string }
-  | { view: 'verify-email'; token: string };
+  | { view: 'verify-email'; token: string; email?: string };
 
 function parseInitialPublicAuthView(): PublicAuthView {
   if (typeof window === 'undefined') return { view: 'auth' };
@@ -294,6 +295,16 @@ export default function App() {
     }
   }
 
+  async function handleRefreshCurrentUser(): Promise<AuthUser | null> {
+    const res = await api.me();
+    setUser(res.user);
+    if (res.user.emailVerified) {
+      setVerifyBannerMessage('');
+      setVerifyBannerError('');
+    }
+    return res.user;
+  }
+
   function handleSelectSubmission(submissionId: number, page: PageKey) {
     setSelectedSubmissionId(submissionId);
     setActivePage(page);
@@ -321,11 +332,12 @@ export default function App() {
           token={authView.token}
           isAuthenticated={Boolean(user)}
           userEmail={user?.email}
+          userEmailVerified={user?.emailVerified}
+          initialEmail={authView.email}
           theme={theme}
           onToggleTheme={toggleTheme}
           onVerifiedRefresh={async () => {
-            const res = await api.me();
-            setUser(res.user);
+            await handleRefreshCurrentUser();
           }}
           onBackToApp={() => {
             clearAuthQueryParams();
@@ -377,7 +389,9 @@ export default function App() {
         <AuthPage
           onAuthSuccess={handleAuthSuccess}
           onForgotPassword={() => setAuthView({ view: 'forgot-password' })}
-          onResendVerification={() => setAuthView({ view: 'verify-email', token: '' })}
+          onResendVerification={(email?: string) =>
+            setAuthView({ view: 'verify-email', token: '', email: email || undefined })
+          }
           theme={theme}
           onToggleTheme={toggleTheme}
           sessionNotice={sessionNotice}
@@ -386,6 +400,7 @@ export default function App() {
     );
   }
 
+  const verificationGateActive = Boolean(user.verificationRequired && !user.emailVerified);
   const currentNav = NAV_ITEMS.find((item) => item.key === activePage) || NAV_ITEMS[0];
   const filteredQuickResults = searchResults.filter(
     (s) =>
@@ -553,8 +568,8 @@ export default function App() {
           </div>
         </header>
 
-        {/* Unverified Email Notice Banner */}
-        {!user.emailVerified && !verifyBannerDismissed && activePage !== 'settings' && (
+        {/* Unverified Email Notice Banner (optional for pre-migration legacy users only; required users get full gate below) */}
+        {!user.emailVerified && !verificationGateActive && !verifyBannerDismissed && activePage !== 'settings' && (
           <div
             role="status"
             className="clay-surface rounded-[24px] px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border border-amber-200/90 dark:border-amber-400/30"
@@ -609,66 +624,137 @@ export default function App() {
 
         {/* Active Page Viewport */}
         <main className="flex-1 pb-6">
-          {activePage === 'dashboard' && (
-            <DashboardPage
-              userRole={user.role}
-              onNavigate={setActivePage}
-              onSelectBrand={(id) => setSelectedBrandId(id)}
-              onSelectSubmission={handleSelectSubmission}
-            />
-          )}
-          {activePage === 'guidelines' && (
-            <GuidelinesPage
-              userRole={user.role}
-              selectedBrandId={selectedBrandId}
-              onSelectBrand={(id) => setSelectedBrandId(id)}
-              onNavigate={setActivePage}
-            />
-          )}
-          {activePage === 'submit' && (
-            <SubmitPage
-              selectedBrandId={selectedBrandId}
-              onSelectBrand={(id) => setSelectedBrandId(id)}
-              onSubmitted={(subId) => handleSelectSubmission(subId, 'analysis')}
-              onNavigate={setActivePage}
-            />
-          )}
-          {activePage === 'analysis' && (
-            <AnalysisPage
-              selectedSubmissionId={selectedSubmissionId}
-              onSelectSubmission={(id) => setSelectedSubmissionId(id)}
-              onNavigate={setActivePage}
-            />
-          )}
-          {activePage === 'corrections' && (
-            <CorrectionsPage
-              selectedSubmissionId={selectedSubmissionId}
-              onSelectSubmission={(id) => setSelectedSubmissionId(id)}
-              onNavigate={setActivePage}
-            />
-          )}
-          {activePage === 'review' && (
-            <ReviewPage
-              userRole={user.role}
-              selectedSubmissionId={selectedSubmissionId}
-              onSelectSubmission={(id) => setSelectedSubmissionId(id)}
-              onNavigate={setActivePage}
-            />
-          )}
-          {activePage === 'history' && (
-            <HistoryPage
-              onSelectSubmission={handleSelectSubmission}
-              onNavigate={setActivePage}
-            />
-          )}
-          {activePage === 'settings' && (
-            <SettingsPage
-              user={user}
-              theme={theme}
-              onToggleTheme={toggleTheme}
-              onUserUpdated={(updated) => setUser(updated)}
-              onSignedOutAll={handleSignedOutAll}
-            />
+          {verificationGateActive && activePage !== 'settings' ? (
+            <section className="clay-surface rounded-[30px] p-7 sm:p-10 max-w-2xl space-y-6 border border-amber-200/90 dark:border-amber-400/30">
+              <div className="flex items-start gap-4">
+                <div className="w-12 h-12 rounded-2xl bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 flex items-center justify-center shrink-0">
+                  <MailWarning className="w-6 h-6" />
+                </div>
+                <div className="space-y-1.5">
+                  <p className="text-xs font-bold uppercase tracking-wider text-indigo-600 dark:text-violet-300">
+                    Email Verification Required
+                  </p>
+                  <h2 className="text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white">
+                    Confirm your email to unlock {user.companyName}
+                  </h2>
+                  <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                    Workspace features are protected until you verify <span className="font-bold text-slate-900 dark:text-white">{user.email}</span>. Click the single-use verification link sent to your inbox (valid for 24 hours). Remember to check your spam or promotions folder if you do not see it within a minute.
+                  </p>
+                </div>
+              </div>
+
+              {verifyBannerMessage && (
+                <div
+                  role="status"
+                  className="rounded-2xl px-4 py-3 text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 dark:bg-emerald-500/15 dark:text-emerald-200 dark:border-emerald-400/30"
+                >
+                  {verifyBannerMessage}
+                </div>
+              )}
+
+              {verifyBannerError && (
+                <div
+                  role="alert"
+                  className="rounded-2xl px-4 py-3 text-xs font-semibold bg-red-50 text-red-800 border border-red-200 dark:bg-rose-500/15 dark:text-rose-200 dark:border-rose-400/30"
+                >
+                  {verifyBannerError}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={handleBannerResendVerification}
+                  disabled={verifyBannerLoading}
+                  className="clay-btn-primary rounded-full px-6 py-3 text-sm font-bold inline-flex items-center gap-2 cursor-pointer disabled:opacity-60"
+                >
+                  <Send className="w-4 h-4" />
+                  {verifyBannerLoading ? 'Sending Verification Email...' : 'Resend Verification Email'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleRefreshCurrentUser().catch(() => {});
+                  }}
+                  className="clay-btn-secondary rounded-full px-5 py-3 text-xs font-bold inline-flex items-center gap-2 cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  I&apos;ve Verified — Check Status
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActivePage('settings')}
+                  className="clay-btn-secondary rounded-full px-5 py-3 text-xs font-semibold cursor-pointer"
+                >
+                  Security Settings
+                </button>
+              </div>
+            </section>
+          ) : (
+            <>
+              {activePage === 'dashboard' && (
+                <DashboardPage
+                  userRole={user.role}
+                  onNavigate={setActivePage}
+                  onSelectBrand={(id) => setSelectedBrandId(id)}
+                  onSelectSubmission={handleSelectSubmission}
+                />
+              )}
+              {activePage === 'guidelines' && (
+                <GuidelinesPage
+                  userRole={user.role}
+                  selectedBrandId={selectedBrandId}
+                  onSelectBrand={(id) => setSelectedBrandId(id)}
+                  onNavigate={setActivePage}
+                />
+              )}
+              {activePage === 'submit' && (
+                <SubmitPage
+                  selectedBrandId={selectedBrandId}
+                  onSelectBrand={(id) => setSelectedBrandId(id)}
+                  onSubmitted={(subId) => handleSelectSubmission(subId, 'analysis')}
+                  onNavigate={setActivePage}
+                />
+              )}
+              {activePage === 'analysis' && (
+                <AnalysisPage
+                  selectedSubmissionId={selectedSubmissionId}
+                  onSelectSubmission={(id) => setSelectedSubmissionId(id)}
+                  onNavigate={setActivePage}
+                />
+              )}
+              {activePage === 'corrections' && (
+                <CorrectionsPage
+                  selectedSubmissionId={selectedSubmissionId}
+                  onSelectSubmission={(id) => setSelectedSubmissionId(id)}
+                  onNavigate={setActivePage}
+                />
+              )}
+              {activePage === 'review' && (
+                <ReviewPage
+                  userRole={user.role}
+                  selectedSubmissionId={selectedSubmissionId}
+                  onSelectSubmission={(id) => setSelectedSubmissionId(id)}
+                  onNavigate={setActivePage}
+                />
+              )}
+              {activePage === 'history' && (
+                <HistoryPage
+                  onSelectSubmission={handleSelectSubmission}
+                  onNavigate={setActivePage}
+                />
+              )}
+              {activePage === 'settings' && (
+                <SettingsPage
+                  user={user}
+                  theme={theme}
+                  onToggleTheme={toggleTheme}
+                  onUserUpdated={(updated) => setUser(updated)}
+                  onRefreshUser={handleRefreshCurrentUser}
+                  onSignedOutAll={handleSignedOutAll}
+                />
+              )}
+            </>
           )}
         </main>
       </div>

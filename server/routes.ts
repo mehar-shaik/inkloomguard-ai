@@ -29,6 +29,8 @@ import {
 import {
   isEmailConfigured,
   buildAppActionUrl,
+  resolveAppBaseUrl,
+  redactEmailSecrets,
   sendVerificationEmail,
   sendPasswordResetEmail,
   sendPasswordChangedEmail,
@@ -154,12 +156,35 @@ const resetPasswordRateLimit = createRateLimiter({
   message: 'Too many password reset attempts. Please wait 15 minutes and try again.',
 });
 
-const resendVerificationRateLimit = createRateLimiter({
+function consumeRateLimitSlot(options: {
+  prefix: string;
+  windowMs: number;
+  maxAttempts: number;
+  key: string;
+}): boolean {
+  const mapKey = `${options.prefix}:${options.key}`;
+  const now = Date.now();
+
+  if (authAttempts.size > 500) {
+    pruneAuthAttempts(now);
+  }
+
+  const record = authAttempts.get(mapKey);
+  if (!record || record.resetAt <= now) {
+    if (record) authAttempts.delete(mapKey);
+    authAttempts.set(mapKey, { count: 1, resetAt: now + options.windowMs });
+    return true;
+  }
+  record.count += 1;
+  return record.count <= options.maxAttempts;
+}
+
+const RESEND_VERIFICATION_RATE_LIMIT = {
   prefix: 'resend-verify',
   windowMs: 15 * 60 * 1000,
   maxAttempts: 3,
   message: 'Too many verification email requests. Please wait before requesting another email.',
-});
+};
 
 const verifyEmailRateLimit = createRateLimiter({
   prefix: 'verify-email',
@@ -176,7 +201,9 @@ const changePasswordRateLimit = createRateLimiter({
 });
 
 function getRequestOrigin(req: express.Request): string | undefined {
-  const host = req.get('x-forwarded-host') || req.get('host');
+  const rawHost = req.get('x-forwarded-host') || req.get('host');
+  if (!rawHost) return undefined;
+  const host = rawHost.split(',')[0].trim();
   if (!host) return undefined;
   const proto = (req.get('x-forwarded-proto') || req.protocol || 'http').split(',')[0].trim();
   return `${proto}://${host}`;
@@ -387,9 +414,10 @@ export function createApiRouter(): express.Router {
         try {
           const { rawToken, expiresHours } = await createEmailVerificationToken(user.id, user.companyId);
           if (isEmailConfigured()) {
+            const origin = getRequestOrigin(req);
             const verificationUrl = buildAppActionUrl(
               `/?mode=verify-email&token=${encodeURIComponent(rawToken)}`,
-              getRequestOrigin(req)
+              origin
             );
             await sendVerificationEmail({
               to: user.email,
@@ -399,15 +427,19 @@ export function createApiRouter(): express.Router {
               expiresHours,
             });
             verificationEmailSent = true;
+            console.log(
+              `[InkloomGuard AI] Registration verification email dispatched (userId=${user.id}, baseUrl=${resolveAppBaseUrl(origin)})`
+            );
           } else {
-            verificationEmailError = 'Email delivery is not configured yet.';
+            verificationEmailError =
+              'Email delivery is not configured on the server yet. Once configured, click Resend Verification Email.';
           }
         } catch (emailErr) {
-          console.error(
-            '[InkloomGuard AI] Verification email dispatch error during registration:',
+          const safeError = redactEmailSecrets(
             emailErr instanceof Error ? emailErr.message : 'Email delivery error'
           );
-          verificationEmailError = 'Verification email could not be sent automatically. You can resend it from Settings.';
+          console.error('[InkloomGuard AI] Verification email dispatch error during registration:', safeError);
+          verificationEmailError = safeError;
         }
 
         res.status(201).json({
@@ -633,8 +665,38 @@ export function createApiRouter(): express.Router {
 
   router.post(
     '/auth/resend-verification',
-    resendVerificationRateLimit,
     asyncHandler(async (req, res) => {
+      const authedUser = await tryAuthenticateRequest(req);
+      const explicitEmailRaw = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+      const hasExplicitEmail = Boolean(explicitEmailRaw);
+
+      if (hasExplicitEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(explicitEmailRaw)) {
+        res.status(400).json({ error: 'Please enter a valid email address.' });
+        return;
+      }
+
+      if (!hasExplicitEmail && !authedUser) {
+        res.status(400).json({ error: 'Please enter a valid email address.' });
+        return;
+      }
+
+      // If caller is authenticated for this exact account (or omitted email) and it's already verified, inform them without burning a rate-limit slot
+      if (authedUser && (!hasExplicitEmail || authedUser.email === explicitEmailRaw) && authedUser.emailVerified) {
+        res.status(400).json({ error: 'Your email address is already verified.' });
+        return;
+      }
+
+      const allowed = consumeRateLimitSlot({
+        prefix: RESEND_VERIFICATION_RATE_LIMIT.prefix,
+        windowMs: RESEND_VERIFICATION_RATE_LIMIT.windowMs,
+        maxAttempts: RESEND_VERIFICATION_RATE_LIMIT.maxAttempts,
+        key: req.ip || 'unknown',
+      });
+      if (!allowed) {
+        res.status(429).json({ error: RESEND_VERIFICATION_RATE_LIMIT.message });
+        return;
+      }
+
       if (!isEmailConfigured()) {
         res.status(503).json({
           error: 'Email service is not configured. Please configure Brevo email settings before sending verification emails.',
@@ -642,12 +704,10 @@ export function createApiRouter(): express.Router {
         return;
       }
 
-      const authedUser = await tryAuthenticateRequest(req);
-      if (authedUser) {
-        if (authedUser.emailVerified) {
-          res.status(400).json({ error: 'Your email address is already verified.' });
-          return;
-        }
+      const origin = getRequestOrigin(req);
+
+      // Authenticated user requesting verification for their own account (no explicit override email)
+      if (!hasExplicitEmail && authedUser) {
         try {
           const { rawToken, expiresHours } = await createEmailVerificationToken(
             authedUser.id,
@@ -655,7 +715,7 @@ export function createApiRouter(): express.Router {
           );
           const verificationUrl = buildAppActionUrl(
             `/?mode=verify-email&token=${encodeURIComponent(rawToken)}`,
-            getRequestOrigin(req)
+            origin
           );
           await sendVerificationEmail({
             to: authedUser.email,
@@ -664,32 +724,28 @@ export function createApiRouter(): express.Router {
             verificationUrl,
             expiresHours,
           });
+          console.log(
+            `[InkloomGuard AI] Resend verification email dispatched (userId=${authedUser.id}, baseUrl=${resolveAppBaseUrl(origin)})`
+          );
           res.json({
             ok: true,
             message: 'A new verification email has been sent to your registered address.',
           });
           return;
         } catch (err) {
-          console.error(
-            '[InkloomGuard AI] Resend verification email failed:',
-            err instanceof Error ? err.message : 'Email delivery error'
+          const safeError = redactEmailSecrets(
+            err instanceof Error ? err.message : 'Unable to send verification email right now.'
           );
-          res.status(503).json({
-            error: 'Unable to send verification email right now. Please try again later.',
-          });
+          console.error('[InkloomGuard AI] Resend verification email failed:', safeError);
+          res.status(503).json({ error: safeError });
           return;
         }
       }
 
-      const email = String(req.body?.email || '').trim().toLowerCase();
-      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        res.status(400).json({ error: 'Please enter a valid email address.' });
-        return;
-      }
-
+      // Explicit email provided (unauthenticated flow OR signed-in user requesting for a specific email)
       const neutralMessage =
         'If an unverified account exists for that email address, a verification email has been sent.';
-      const targetUser = await findUserByEmailForAuth(email);
+      const targetUser = await findUserByEmailForAuth(explicitEmailRaw);
       if (targetUser && !targetUser.emailVerified) {
         try {
           const { rawToken, expiresHours } = await createEmailVerificationToken(
@@ -698,7 +754,7 @@ export function createApiRouter(): express.Router {
           );
           const verificationUrl = buildAppActionUrl(
             `/?mode=verify-email&token=${encodeURIComponent(rawToken)}`,
-            getRequestOrigin(req)
+            origin
           );
           await sendVerificationEmail({
             to: targetUser.email,
@@ -707,14 +763,15 @@ export function createApiRouter(): express.Router {
             verificationUrl,
             expiresHours,
           });
-        } catch (err) {
-          console.error(
-            '[InkloomGuard AI] Public resend verification email failed:',
-            err instanceof Error ? err.message : 'Email delivery error'
+          console.log(
+            `[InkloomGuard AI] Public resend verification email dispatched (userId=${targetUser.id}, baseUrl=${resolveAppBaseUrl(origin)})`
           );
-          res.status(503).json({
-            error: 'Unable to send verification email right now. Please try again later.',
-          });
+        } catch (err) {
+          const safeError = redactEmailSecrets(
+            err instanceof Error ? err.message : 'Unable to send verification email right now.'
+          );
+          console.error('[InkloomGuard AI] Public resend verification email failed:', safeError);
+          res.status(503).json({ error: safeError });
           return;
         }
       }

@@ -104,6 +104,8 @@ InkloomGuard AI runs as a **single-server stateless full-stack Node.js applicati
 │   ├── auth.ts                        # Async JWT signing/verification, revocation, RBAC middleware
 │   ├── complianceEngine.ts            # 8-area deterministic + Gemini compliance engine
 │   ├── db.ts                          # Async PostgreSQL (DATABASE_URL) & local SQLite dual-engine adapter
+│   ├── email.ts                       # Brevo Transactional Email HTTPS API client (https://api.brevo.com/v3/smtp/email)
+│   ├── env.ts                         # Conditional dotenv loader (loads .env locally; skipped during npm test)
 │   ├── parsers.ts                     # In-memory magic-byte/SVG validation, PDF/DOCX/TXT/Image parsers
 │   ├── routes.ts                      # All REST API endpoints (/api/*)
 │   └── storage.ts                     # Supabase Storage (inkloomguard-files) & local fallback abstraction
@@ -290,7 +292,12 @@ All environment variables are **backend-only**. Never prefix database URLs, Supa
 | `SUPABASE_STORAGE_BUCKET` | **Yes** | Private Supabase Storage bucket name: `inkloomguard-files`. |
 | `JWT_SECRET` | **Yes** | Random secret (`>= 32` chars) used to sign/verify Bearer JWTs across restarts. |
 | `GEMINI_API_KEY` | **Yes** (for AI checks) | Google Gemini API key used server-side for guideline extraction and compliance analysis. |
-| `NODE_ENV` | **Yes** (`production`) | Serves pre-built `dist/` SPA and enforces persistent Postgres + Supabase Storage in production. |
+| `GEMINI_TIMEOUT_MS` | Optional (`120000`) | Positive integer timeout in milliseconds for server-side Gemini API operations (defaults to `120000`). |
+| `BREVO_API_KEY` | **Yes** (for transactional email) | Server-side Brevo Transactional Email HTTPS API key (`POST https://api.brevo.com/v3/smtp/email`). Never expose to frontend. |
+| `BREVO_SENDER_EMAIL` | **Yes** (for transactional email) | Verified Brevo sender email address used for verification and password-reset emails. |
+| `BREVO_SENDER_NAME` | Optional (`InkloomGuard AI`) | Display sender name used in Brevo transactional emails (defaults to `InkloomGuard AI`). |
+| `APP_BASE_URL` | **Yes** | Public application origin used to build email verification and password-reset links (`http://localhost:3000` locally; `https://<your-render-service>.onrender.com` on Render). |
+| `NODE_ENV` | **Yes** (`production`) | `development` locally; `production` on Render (serves pre-built `dist/` SPA and enforces persistent Postgres + Supabase Storage). |
 | `PORT` | Injected by Render | HTTP bind port (`process.env.PORT`, defaults to `3000` locally). |
 | `CORS_ORIGINS` | Recommended after deploy | Comma-separated production origins (e.g. `https://inkloomguard-ai.onrender.com`). `APP_URL` and `RENDER_EXTERNAL_URL` are also accepted. |
 | `DATA_DIR` | Local Dev Only | Directory for local SQLite + local upload fallback when Supabase env vars are unset. Never used in production. |
@@ -303,15 +310,30 @@ Prerequisites:
 
 Copy `.env.example` to `.env` (never commit `.env`):
 
+```powershell
+# Windows PowerShell
+Copy-Item .env.example .env
+```
+
 ```bash
+# macOS / Linux
 cp .env.example .env
 ```
 
-To test against Supabase locally, fill in `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_STORAGE_BUCKET=inkloomguard-files`, `JWT_SECRET`, and `GEMINI_API_KEY` in `.env`. Leave `DATABASE_URL` and `SUPABASE_*` unset to develop against local SQLite + `DATA_DIR/uploads/`.
+### Local Configuration Notes
+- **Local Database & Storage (Zero Cloud Setup Required)**: `.env.example` keeps `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `JWT_SECRET` commented out so local runs automatically use SQLite (`./data/inkloomguard.db` with `email_verification_tokens` and `password_reset_tokens` created on boot), local `./data/uploads/`, and an auto-generated `./data/.jwt_secret`.
+- **Local Verification Links**: Keep `APP_BASE_URL="http://localhost:3000"` and `APP_URL="http://localhost:3000"` in your local `.env` so verification and password-reset emails link to `http://localhost:3000/?mode=verify-email&token=...`. On Render, keep `APP_BASE_URL` set to `https://<your-render-service>.onrender.com` in the Render dashboard.
+- **Real Brevo HTTPS Email Delivery Locally**: Set `BREVO_API_KEY`, a verified `BREVO_SENDER_EMAIL`, and `BREVO_SENDER_NAME` in `.env` (server-side only — never prefix with `VITE_`). Leave `NODE_ENV="development"`.
 
 ## 27. Installation Commands
 
+```powershell
+# Windows PowerShell
+npm install --include=dev --legacy-peer-deps
+```
+
 ```bash
+# macOS / Linux (or with bun)
 bun install --frozen-lockfile
 # or with npm:
 npm install --include=dev --legacy-peer-deps
@@ -347,18 +369,34 @@ This script copies rows with `ON CONFLICT DO NOTHING`, resets PostgreSQL `IDENTI
 
 ## 29. How to Run the Application
 
-**Development mode** (Express + Vite middleware on `http://localhost:3000`):
+InkloomGuard AI serves both the **Express `/api/*` backend** and the **React + Vite frontend** from a single server on `http://localhost:3000`.
 
-```bash
+**Development mode (Windows PowerShell / macOS / Linux)**:
+
+```powershell
 npm run dev
 ```
 
-**Production simulation locally**:
+On startup, confirm the server logs show:
+- `db=sqlite` (or `db=postgres` if testing with `DATABASE_URL`)
+- `[InkloomGuard AI] Email delivery ready: provider=brevo-https, endpoint=https://api.brevo.com/v3/smtp/email, appBaseUrl=http://localhost:3000`
 
-```bash
-npm run build
-NODE_ENV=production npm start
+Verify health and Brevo readiness from PowerShell:
+
+```powershell
+Invoke-RestMethod http://localhost:3000/api/health
 ```
+
+Confirm `"status": "ok"`, `"database": "connected"`, and `"emailConfigured": true`.
+
+**Production simulation locally (Windows PowerShell)**:
+
+```powershell
+npm run build
+$env:NODE_ENV="production"; npm start
+```
+
+> **Note:** Production mode (`NODE_ENV="production"`) requires `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `JWT_SECRET`. For normal local email verification testing, use `npm run dev` with `NODE_ENV="development"`.
 
 ## 30. How to Build for Production
 
@@ -407,6 +445,10 @@ Add these secrets privately in **Render → Environment** (never commit them):
 - `SUPABASE_STORAGE_BUCKET=inkloomguard-files`
 - `JWT_SECRET=<random-64-char-hex-string>`
 - `GEMINI_API_KEY=<your-gemini-api-key>`
+- `APP_BASE_URL=https://<your-render-service>.onrender.com`
+- `BREVO_API_KEY=<your-brevo-transactional-api-key>` (uses Brevo HTTPS API over port 443; no outbound SMTP ports needed)
+- `BREVO_SENDER_EMAIL=<verified-sender@your-domain>`
+- `BREVO_SENDER_NAME=InkloomGuard AI`
 - `CORS_ORIGINS=https://<your-render-service>.onrender.com` (update right after Render assigns your live URL)
 
 ### Step 8: Set Up GitHub Actions
@@ -441,13 +483,25 @@ In production, all relational data lives in **Supabase PostgreSQL** (`DATABASE_U
 
 ## 34. Testing Instructions
 
-### Automated Local Integration Suite
+### Automated Local Integration Suite (PowerShell / Bash)
 
-```bash
+> `npm test` runs in an isolated temporary directory using SQLite and mocked Brevo `fetch` transport — it skips loading `.env` and never sends real emails.
+
+```powershell
 npm run lint
 npm run build
 npm test
 ```
+
+### Local Email Verification End-to-End Test (Brevo HTTPS API)
+
+1. Ensure `.env` has `NODE_ENV="development"`, `APP_BASE_URL="http://localhost:3000"`, `APP_URL="http://localhost:3000"`, and your real `BREVO_API_KEY` + verified `BREVO_SENDER_EMAIL`. Keep `DATABASE_URL` commented out to use local SQLite (`./data/inkloomguard.db`).
+2. Start the app with `npm run dev` and confirm `[InkloomGuard AI] Email delivery ready: ... appBaseUrl=http://localhost:3000` appears in the terminal.
+3. Open `http://localhost:3000` in your browser and switch to **Sign Up** (`POST /api/auth/register`) with a real inbox you can check.
+4. Confirm you land on the **Email Verification Required** gate (protected workspace tabs stay gated until verified) and check your inbox for the Brevo verification email.
+5. Verify the CTA URL inside the email points to `http://localhost:3000/?mode=verify-email&token=<64-hex-token>`.
+6. Open that link in your browser — `VerifyEmailPage` calls `POST /api/auth/verify-email`, marks `email_verified = 1` in SQLite, consumes the single-use hashed token, and unlocks `/api/dashboard`.
+7. Test **Resend Verification** (`POST /api/auth/resend-verification`) for another unverified email (rate limit: 3 requests per 15 minutes per IP) and confirm **Forgot Password** (`POST /api/auth/forgot-password`) still sends working `http://localhost:3000/?mode=reset-password&token=...` emails.
 
 ### Live Production Persistence Verification Procedure (Supabase + Render Free)
 Run these steps against your live deployed URL `https://<your-app>.onrender.com`:

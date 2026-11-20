@@ -2,11 +2,14 @@ export const BREVO_API_ENDPOINT = 'https://api.brevo.com/v3/smtp/email';
 export const BREVO_TIMEOUT_MS = 12_000;
 export const DEFAULT_BREVO_SENDER_NAME = 'InkloomGuard AI';
 
+export type EmailKind = 'verification' | 'password-reset' | 'password-changed';
+
 export interface EmailMessage {
   to: string;
   subject: string;
   html: string;
   text: string;
+  emailType?: EmailKind;
 }
 
 export interface EmailSendResult {
@@ -62,10 +65,22 @@ function isValidEmailAddress(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
+function stripOptionalQuotes(value: string): string {
+  const trimmed = value.trim();
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
 function getEmailSettings() {
-  const apiKey = (process.env.BREVO_API_KEY ?? '').trim();
-  const senderEmail = (process.env.BREVO_SENDER_EMAIL ?? '').trim();
-  const rawSenderName = (process.env.BREVO_SENDER_NAME ?? '').trim();
+  const apiKey = stripOptionalQuotes(process.env.BREVO_API_KEY ?? '');
+  const senderEmail = stripOptionalQuotes(process.env.BREVO_SENDER_EMAIL ?? '');
+  const rawSenderName = stripOptionalQuotes(process.env.BREVO_SENDER_NAME ?? '');
   const senderName =
     rawSenderName && !isPlaceholderValue(rawSenderName) ? rawSenderName : DEFAULT_BREVO_SENDER_NAME;
 
@@ -125,13 +140,14 @@ export function getEmailDiagnostics(): EmailDiagnostics {
 
 export function logEmailStartupDiagnostics(): void {
   const diag = getEmailDiagnostics();
+  const baseUrl = resolveAppBaseUrl();
   if (diag.configured) {
     console.log(
-      `[InkloomGuard AI] Email delivery ready: provider=${diag.provider}, endpoint=${diag.endpoint}`
+      `[InkloomGuard AI] Email delivery ready: provider=${diag.provider}, endpoint=${diag.endpoint}, appBaseUrl=${baseUrl}`
     );
   } else {
     console.warn(
-      `[InkloomGuard AI] Email delivery inactive (provider=${diag.provider}): ${diag.error}`
+      `[InkloomGuard AI] Email delivery inactive (provider=${diag.provider}, appBaseUrl=${baseUrl}): ${diag.error}`
     );
   }
 }
@@ -239,14 +255,35 @@ export function formatBrevoApiError(err: unknown): string {
   return `Brevo email delivery error: ${rawMessage.slice(0, 240)}`;
 }
 
-export function resolveAppBaseUrl(requestOrigin?: string): string {
-  const configured =
-    process.env.APP_BASE_URL?.trim() ||
-    process.env.APP_URL?.trim() ||
-    process.env.RENDER_EXTERNAL_URL?.trim();
+function isLocalhostUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+  } catch {
+    return /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(url);
+  }
+}
 
-  const candidate = configured || requestOrigin || 'http://localhost:3000';
-  return candidate.replace(/\/+$/, '');
+export function resolveAppBaseUrl(requestOrigin?: string): string {
+  const isProd = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
+  const rawAppBaseUrl = stripOptionalQuotes(process.env.APP_BASE_URL ?? '');
+  const rawAppUrl = stripOptionalQuotes(process.env.APP_URL ?? '');
+  const rawRenderExternalUrl = stripOptionalQuotes(process.env.RENDER_EXTERNAL_URL ?? '');
+  const appBaseUrl = isPlaceholderValue(rawAppBaseUrl) ? '' : rawAppBaseUrl;
+  const appUrl = isPlaceholderValue(rawAppUrl) ? '' : rawAppUrl;
+  const renderExternalUrl = isPlaceholderValue(rawRenderExternalUrl) ? '' : rawRenderExternalUrl;
+  const reqOrigin = requestOrigin ? requestOrigin.trim() : '';
+
+  const candidates = [appBaseUrl, appUrl, renderExternalUrl, reqOrigin].filter(Boolean);
+  let chosen = '';
+  if (isProd) {
+    chosen = candidates.find((c) => !isLocalhostUrl(c)) || candidates[0] || '';
+  } else {
+    chosen = candidates[0] || '';
+  }
+
+  const fallback = chosen || 'http://localhost:3000';
+  return fallback.replace(/\/+$/, '');
 }
 
 export function buildAppActionUrl(pathWithQuery: string, requestOrigin?: string): string {
@@ -361,8 +398,18 @@ function renderInkloomEmailLayout(params: {
 }
 
 export async function sendEmail(message: EmailMessage): Promise<EmailSendResult> {
+  const recipientEmail = String(message.to || '').trim();
+  if (!recipientEmail || !isValidEmailAddress(recipientEmail)) {
+    throw new Error('Recipient email address is invalid.');
+  }
+
+  const normalizedMessage: EmailMessage = {
+    ...message,
+    to: recipientEmail,
+  };
+
   if (testEmailSender) {
-    const result = await testEmailSender(message);
+    const result = await testEmailSender(normalizedMessage);
     return result && typeof result === 'object' ? result : {};
   }
 
@@ -375,6 +422,21 @@ export async function sendEmail(message: EmailMessage): Promise<EmailSendResult>
 
   const { apiKey, senderEmail, senderName } = getEmailSettings();
   const fetchImpl = testFetch || fetch;
+  const emailType = normalizedMessage.emailType || 'transactional';
+
+  const payload: Record<string, unknown> = {
+    sender: {
+      name: senderName,
+      email: senderEmail,
+    },
+    to: [{ email: recipientEmail }],
+    subject: normalizedMessage.subject,
+    htmlContent: normalizedMessage.html,
+    textContent: normalizedMessage.text,
+  };
+  if (normalizedMessage.emailType) {
+    payload.tags = [normalizedMessage.emailType];
+  }
 
   let response: Response;
   try {
@@ -385,20 +447,13 @@ export async function sendEmail(message: EmailMessage): Promise<EmailSendResult>
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify({
-        sender: {
-          name: senderName,
-          email: senderEmail,
-        },
-        to: [{ email: message.to }],
-        subject: message.subject,
-        htmlContent: message.html,
-        textContent: message.text,
-      }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(BREVO_TIMEOUT_MS),
     });
   } catch (err) {
-    throw new Error(formatBrevoApiError(err));
+    const formatted = formatBrevoApiError(err);
+    console.error(`[InkloomGuard AI] Brevo email network/timeout error (type=${emailType}): ${formatted}`);
+    throw new Error(formatted);
   }
 
   let rawBody = '';
@@ -406,47 +461,57 @@ export async function sendEmail(message: EmailMessage): Promise<EmailSendResult>
     rawBody = await response.text();
   } catch (err) {
     if (!response.ok) {
-      throw new Error(formatBrevoApiError({ status: response.status }));
+      const formatted = formatBrevoApiError({ status: response.status });
+      console.error(`[InkloomGuard AI] Brevo email error (type=${emailType}, status=${response.status}): ${formatted}`);
+      throw new Error(formatted);
     }
-    throw new Error(formatBrevoApiError(err));
+    const formatted = formatBrevoApiError(err);
+    console.error(`[InkloomGuard AI] Brevo email body read error (type=${emailType}): ${formatted}`);
+    throw new Error(formatted);
   }
 
   if (!response.ok) {
-    throw new Error(formatBrevoApiError({ status: response.status, message: rawBody }));
+    const formatted = formatBrevoApiError({ status: response.status, message: rawBody });
+    console.error(`[InkloomGuard AI] Brevo email rejected (type=${emailType}, status=${response.status}): ${formatted}`);
+    throw new Error(formatted);
   }
 
   const trimmed = rawBody.trim();
   if (!trimmed) {
-    if (response.status === 204) {
-      return {};
-    }
-    throw new Error(
-      formatBrevoApiError({ message: 'Unexpected empty JSON response payload from Brevo' })
+    console.log(
+      `[InkloomGuard AI] Brevo email accepted (type=${emailType}, status=${response.status}, messageId=none)`
     );
+    return {};
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(trimmed);
   } catch (err) {
-    throw new Error(formatBrevoApiError(err));
+    const formatted = formatBrevoApiError(err);
+    console.error(`[InkloomGuard AI] Brevo email response parse error (type=${emailType}): ${formatted}`);
+    throw new Error(formatted);
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(
-      formatBrevoApiError({ message: 'Unexpected response payload shape from Brevo' })
-    );
+    const formatted = formatBrevoApiError({ message: 'Unexpected response payload shape from Brevo' });
+    console.error(`[InkloomGuard AI] Brevo email response shape error (type=${emailType}): ${formatted}`);
+    throw new Error(formatted);
   }
 
   const data = parsed as { messageId?: unknown; messageIds?: unknown };
-  if (typeof data.messageId === 'string' && data.messageId.trim()) {
-    return { messageId: data.messageId.trim() };
-  }
-  if (Array.isArray(data.messageIds) && typeof data.messageIds[0] === 'string' && data.messageIds[0].trim()) {
-    return { messageId: data.messageIds[0].trim() };
-  }
+  const messageId =
+    typeof data.messageId === 'string' && data.messageId.trim()
+      ? data.messageId.trim()
+      : Array.isArray(data.messageIds) && typeof data.messageIds[0] === 'string' && data.messageIds[0].trim()
+        ? data.messageIds[0].trim()
+        : undefined;
 
-  return {};
+  console.log(
+    `[InkloomGuard AI] Brevo email accepted (type=${emailType}, status=${response.status}, messageId=${messageId || 'none'})`
+  );
+
+  return messageId ? { messageId } : {};
 }
 
 export async function sendVerificationEmail(params: {
@@ -493,6 +558,7 @@ export async function sendVerificationEmail(params: {
     subject: 'Verify your email address — InkloomGuard AI',
     html,
     text,
+    emailType: 'verification',
   });
 }
 
@@ -538,6 +604,7 @@ export async function sendPasswordResetEmail(params: {
     subject: 'Reset your password — InkloomGuard AI',
     html,
     text,
+    emailType: 'password-reset',
   });
 }
 
@@ -583,5 +650,6 @@ export async function sendPasswordChangedEmail(params: {
     subject: 'Your password was changed — InkloomGuard AI',
     html,
     text,
+    emailType: 'password-changed',
   });
 }

@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import './server/env.ts';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import path from 'node:path';

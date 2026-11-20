@@ -42,6 +42,7 @@ const {
   isEmailConfigured,
   getEmailDiagnostics,
   formatBrevoApiError,
+  resolveAppBaseUrl,
   sendEmail,
 } = await import('../server/email.ts');
 const {
@@ -278,6 +279,7 @@ async function runUnitChecks() {
   assert.equal(isEmailConfigured(), false);
   assert.deepEqual(unconfiguredEmail.missing, ['BREVO_API_KEY', 'BREVO_SENDER_EMAIL']);
 
+  // Synthetic non-secret test fixtures solely for verifying Brevo HTTPS payload and secret redaction
   const syntheticBrevoKey = ['mock', 'brevo', 'api', 'key', '0001'].join('-');
   const syntheticXkeysibShape = ['xkeysib', 'citest', '000000', 'mockredact'].join('-');
   const syntheticSenderEmail = 'noreply@example.test';
@@ -1259,43 +1261,46 @@ async function main() {
       }> = [];
       let brevoFailureResponse: { status: number; body: string } | null = null;
 
-      setFetchForTesting(async (input, init) => {
-        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-        const headers = Object.fromEntries(new Headers(init?.headers).entries());
-        capturedBrevoRequests.push({
-          url,
-          method: String(init?.method || 'GET'),
-          headers,
-        });
+      const installMockBrevoFetch = () =>
+        setFetchForTesting(async (input, init) => {
+          const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+          const headers = Object.fromEntries(new Headers(init?.headers).entries());
+          capturedBrevoRequests.push({
+            url,
+            method: String(init?.method || 'GET'),
+            headers,
+          });
 
-        if (brevoFailureResponse) {
-          return new Response(brevoFailureResponse.body, {
-            status: brevoFailureResponse.status,
+          if (brevoFailureResponse) {
+            return new Response(brevoFailureResponse.body, {
+              status: brevoFailureResponse.status,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const parsedBody = JSON.parse(String(init?.body || '{}')) as {
+            sender: { name: string; email: string };
+            to: Array<{ email: string }>;
+            subject: string;
+            htmlContent: string;
+            textContent: string;
+          };
+
+          sentEmails.push({
+            sender: parsedBody.sender,
+            to: parsedBody.to,
+            subject: parsedBody.subject,
+            html: parsedBody.htmlContent,
+            text: parsedBody.textContent,
+          });
+
+          return new Response(JSON.stringify({ messageId: `<mock-brevo-${sentEmails.length}@example.test>` }), {
+            status: 201,
             headers: { 'Content-Type': 'application/json' },
           });
-        }
-
-        const parsedBody = JSON.parse(String(init?.body || '{}')) as {
-          sender: { name: string; email: string };
-          to: Array<{ email: string }>;
-          subject: string;
-          htmlContent: string;
-          textContent: string;
-        };
-
-        sentEmails.push({
-          sender: parsedBody.sender,
-          to: parsedBody.to,
-          subject: parsedBody.subject,
-          html: parsedBody.htmlContent,
-          text: parsedBody.textContent,
         });
 
-        return new Response(JSON.stringify({ messageId: `<mock-brevo-${sentEmails.length}@relay.test>` }), {
-          status: 201,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      });
+      installMockBrevoFetch();
 
       // 9a. Weak password rejected on registration
       const weakRegRes = await req('/api/auth/register', {
@@ -1463,6 +1468,99 @@ async function main() {
         body: JSON.stringify({ token: freshVerifyToken }),
       });
       assert.equal(oldVerifyRes.status, 400);
+
+      // Explicit email resend works even when caller carries another verified user's Bearer token,
+      // and invalid-format resend requests do NOT consume rate-limit quota
+      authAttempts.clear();
+      const invalidEmailResend = await req('/api/auth/resend-verification', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ email: 'not-an-email' }),
+      });
+      assert.equal(invalidEmailResend.status, 400);
+
+      // Register a second unverified user and verify registration-time Brevo failure exposes safe diagnostic (no secret leak)
+      brevoFailureResponse = {
+        status: 400,
+        body: JSON.stringify({ code: 'invalid_parameter', message: `Invalid sender ${mockSenderAddress} with ${mockBrevoKey}` }),
+      };
+      const regFailEmailRes = await req('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Pat Pending',
+          email: 'pat.pending@novapay-ci.test',
+          password: 'Password123!',
+          companyName: 'PendingOrg',
+          role: 'reviewer',
+        }),
+      });
+      assert.equal(regFailEmailRes.status, 201);
+      assert.equal(regFailEmailRes.json!.verificationEmailSent, false);
+      assert.match(String(regFailEmailRes.json!.verificationEmailError || ''), /Brevo rejected the email payload \(HTTP 400\)/i);
+      assert.ok(!String(regFailEmailRes.json!.verificationEmailError || '').includes(mockBrevoKey));
+      assert.ok(!String(regFailEmailRes.json!.verificationEmailError || '').includes(mockSenderAddress));
+      brevoFailureResponse = null;
+
+      // Resend verification explicitly for Pat's email while Sam's verified Bearer token is present
+      sentEmails.length = 0;
+      const crossSessionResend = await req('/api/auth/resend-verification', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ email: 'pat.pending@novapay-ci.test' }),
+      });
+      assert.equal(crossSessionResend.status, 200);
+      assert.equal(sentEmails.length, 1);
+      assert.deepEqual(sentEmails[0].to, [{ email: 'pat.pending@novapay-ci.test' }]);
+      const patTokenMatch = sentEmails[0].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
+      assert.ok(patTokenMatch && patTokenMatch[1]);
+
+      // Verification token lookup is case-insensitive on hex characters & unlocks Pat's dashboard
+      const patVerifyRes = await req('/api/auth/verify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: patTokenMatch[1].toUpperCase() }),
+      });
+      assert.equal(patVerifyRes.status, 200);
+      assert.equal(patVerifyRes.json!.ok, true);
+      assert.equal(patVerifyRes.json!.user.emailVerified, true);
+      const patDashRes = await req('/api/dashboard', { headers: authHdr(regFailEmailRes.json!.token as string) });
+      assert.equal(patDashRes.status, 200);
+
+      // Production resolveAppBaseUrl ignores accidental localhost APP_BASE_URL when RENDER_EXTERNAL_URL or HTTPS origin exists
+      const savedBaseUrl = process.env.APP_BASE_URL;
+      const savedAppUrl = process.env.APP_URL;
+      const savedRenderExt = process.env.RENDER_EXTERNAL_URL;
+      const savedEnvProd = process.env.NODE_ENV;
+      try {
+        process.env.NODE_ENV = 'production';
+        delete process.env.APP_URL;
+        process.env.APP_BASE_URL = 'http://localhost:3000';
+        process.env.RENDER_EXTERNAL_URL = 'https://inkloomguard-ai.onrender.com/';
+        assert.equal(resolveAppBaseUrl(), 'https://inkloomguard-ai.onrender.com');
+      } finally {
+        process.env.NODE_ENV = savedEnvProd;
+        if (savedBaseUrl === undefined) delete process.env.APP_BASE_URL;
+        else process.env.APP_BASE_URL = savedBaseUrl;
+        if (savedAppUrl === undefined) delete process.env.APP_URL;
+        else process.env.APP_URL = savedAppUrl;
+        if (savedRenderExt === undefined) delete process.env.RENDER_EXTERNAL_URL;
+        else process.env.RENDER_EXTERNAL_URL = savedRenderExt;
+      }
+
+      // Brevo HTTP 202 with empty response body succeeds cleanly without false JSON parse failure
+      setFetchForTesting(async () => new Response('', { status: 202 }));
+      const empty202Result = await sendEmail({
+        to: 'pat.pending@novapay-ci.test',
+        subject: 'Accepted 202 Check',
+        html: '<p>Accepted</p>',
+        text: 'Accepted',
+        emailType: 'verification',
+      });
+      assert.deepEqual(empty202Result, {});
+
+      // Restore mocked Brevo JSON fetch handler for remaining Section 9 tests
+      installMockBrevoFetch();
 
       // 9d. Unauthorized access rejected on protected account security routes
       const unauthChangePw = await req('/api/auth/change-password', {
