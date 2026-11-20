@@ -1,5 +1,6 @@
-import crypto from 'node:crypto';
-import nodemailer, { type Transporter, type TransportOptions } from 'nodemailer';
+export const BREVO_API_ENDPOINT = 'https://api.brevo.com/v3/smtp/email';
+export const BREVO_TIMEOUT_MS = 12_000;
+export const DEFAULT_BREVO_SENDER_NAME = 'InkloomGuard AI';
 
 export interface EmailMessage {
   to: string;
@@ -8,84 +9,89 @@ export interface EmailMessage {
   text: string;
 }
 
-export interface SmtpConfigStatus {
+export interface EmailSendResult {
+  messageId?: string;
+}
+
+export interface EmailConfigStatus {
   configured: boolean;
   missing: string[];
   error?: string;
 }
 
-export interface SmtpDiagnostics {
+export interface EmailDiagnostics {
   configured: boolean;
-  host: string | null;
-  port: number | null;
-  secure: boolean;
-  starttls: boolean;
+  provider: 'brevo-https';
+  endpoint: string;
+  apiKeyConfigured: boolean;
+  senderEmailConfigured: boolean;
+  senderName: string;
   missing: string[];
   error?: string;
 }
 
-export type EmailSenderFn = (message: EmailMessage) => Promise<void>;
-export type CreateTransportFn = (options: Record<string, unknown>) => Transporter;
+export type EmailSenderFn = (message: EmailMessage) => Promise<void | EmailSendResult>;
+export type FetchFn = typeof fetch;
 
 let testEmailSender: EmailSenderFn | null = null;
-let testCreateTransport: CreateTransportFn | null = null;
-let cachedTransporter: Transporter | null = null;
-let cachedTransporterKey = '';
+let testFetch: FetchFn | null = null;
 
 export function setEmailSenderForTesting(sender: EmailSenderFn | null): void {
   testEmailSender = sender;
 }
 
-export function setCreateTransportForTesting(factory: CreateTransportFn | null): void {
-  testCreateTransport = factory;
-  cachedTransporter = null;
-  cachedTransporterKey = '';
+export function setFetchForTesting(fetchImpl: FetchFn | null): void {
+  testFetch = fetchImpl;
 }
 
 export function resetEmailSenderForTesting(): void {
   testEmailSender = null;
-  testCreateTransport = null;
-  cachedTransporter = null;
-  cachedTransporterKey = '';
+  testFetch = null;
 }
 
 function isPlaceholderValue(value: string): boolean {
-  return /^REPLACE_WITH_/i.test(value) || /^YOUR_/i.test(value);
+  return (
+    /^REPLACE_WITH_/i.test(value) ||
+    /^YOUR_/i.test(value) ||
+    /^MY_/i.test(value) ||
+    /^CHANGE_ME/i.test(value)
+  );
 }
 
-function getSmtpSettings() {
-  const host = process.env.SMTP_HOST?.trim() || '';
-  const portRaw = process.env.SMTP_PORT?.trim() || '';
-  const port = portRaw ? Number(portRaw) : NaN;
-  const user = process.env.SMTP_USER?.trim() || '';
-  const password = (process.env.SMTP_PASSWORD ?? '').trim();
-  const from = process.env.SMTP_FROM?.trim() || '';
-
-  // Port 587 uses STARTTLS (secure=false, requireTLS=true). Port 465 uses implicit TLS (secure=true).
-  const secure = port === 465 ? true : port === 587 ? false : process.env.SMTP_SECURE === 'true';
-  const requireTLS = !secure && port === 587;
-
-  return { host, port, portRaw, user, password, from, secure, requireTLS };
+function isValidEmailAddress(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-export function validateSmtpConfig(): SmtpConfigStatus {
+function getEmailSettings() {
+  const apiKey = (process.env.BREVO_API_KEY ?? '').trim();
+  const senderEmail = (process.env.BREVO_SENDER_EMAIL ?? '').trim();
+  const rawSenderName = (process.env.BREVO_SENDER_NAME ?? '').trim();
+  const senderName =
+    rawSenderName && !isPlaceholderValue(rawSenderName) ? rawSenderName : DEFAULT_BREVO_SENDER_NAME;
+
+  return { apiKey, senderEmail, senderName };
+}
+
+export function validateEmailConfig(): EmailConfigStatus {
   if (testEmailSender) {
     return { configured: true, missing: [] };
   }
 
-  const { host, port, portRaw, user, password, from } = getSmtpSettings();
+  const { apiKey, senderEmail } = getEmailSettings();
   const missing: string[] = [];
-  if (!host || isPlaceholderValue(host)) missing.push('SMTP_HOST');
-  if (!portRaw || !Number.isInteger(port) || port < 1 || port > 65535) missing.push('SMTP_PORT');
-  if (!user || isPlaceholderValue(user)) missing.push('SMTP_USER');
-  if (!password || isPlaceholderValue(password)) missing.push('SMTP_PASSWORD');
-  if (!from || isPlaceholderValue(from) || !from.includes('@')) missing.push('SMTP_FROM');
+
+  if (!apiKey || isPlaceholderValue(apiKey)) {
+    missing.push('BREVO_API_KEY');
+  }
+  if (!senderEmail || isPlaceholderValue(senderEmail) || !isValidEmailAddress(senderEmail)) {
+    missing.push('BREVO_SENDER_EMAIL');
+  }
 
   if (missing.length > 0) {
     return {
       configured: false,
       missing,
-      error: `Missing or invalid SMTP environment variables: ${missing.join(', ')}.`,
+      error: `Missing or invalid Brevo email environment variables: ${missing.join(', ')}.`,
     };
   }
 
@@ -95,119 +101,142 @@ export function validateSmtpConfig(): SmtpConfigStatus {
   };
 }
 
-export function isSmtpConfigured(): boolean {
-  return validateSmtpConfig().configured;
+export function isEmailConfigured(): boolean {
+  return validateEmailConfig().configured;
 }
 
-export function getSmtpDiagnostics(): SmtpDiagnostics {
-  const { host, port, secure, requireTLS } = getSmtpSettings();
-  const status = validateSmtpConfig();
+export function getEmailDiagnostics(): EmailDiagnostics {
+  const { apiKey, senderEmail, senderName } = getEmailSettings();
+  const status = validateEmailConfig();
 
   return {
     configured: status.configured,
-    host: host || null,
-    port: Number.isInteger(port) && port > 0 ? port : null,
-    secure,
-    starttls: requireTLS,
+    provider: 'brevo-https',
+    endpoint: BREVO_API_ENDPOINT,
+    apiKeyConfigured: Boolean(apiKey && !isPlaceholderValue(apiKey)),
+    senderEmailConfigured: Boolean(
+      senderEmail && !isPlaceholderValue(senderEmail) && isValidEmailAddress(senderEmail)
+    ),
+    senderName,
     missing: status.missing,
     error: status.error,
   };
 }
 
-export function logSmtpStartupDiagnostics(): void {
-  const diag = getSmtpDiagnostics();
+export function logEmailStartupDiagnostics(): void {
+  const diag = getEmailDiagnostics();
   if (diag.configured) {
     console.log(
-      `[InkloomGuard AI] Email transport ready: host=${diag.host}, port=${diag.port}, secure=${diag.secure}, starttls=${diag.starttls}`
+      `[InkloomGuard AI] Email delivery ready: provider=${diag.provider}, endpoint=${diag.endpoint}`
     );
   } else {
     console.warn(
-      `[InkloomGuard AI] Email transport inactive (host=${diag.host || 'unset'}, port=${diag.port ?? 'unset'}): ${diag.error}`
+      `[InkloomGuard AI] Email delivery inactive (provider=${diag.provider}): ${diag.error}`
     );
   }
 }
 
-export function formatSmtpError(err: unknown): string {
-  const { host, port, user, password } = getSmtpSettings();
+export function redactEmailSecrets(text: string): string {
+  const { apiKey, senderEmail } = getEmailSettings();
+  let sanitized = String(text || '');
+
+  if (apiKey) {
+    sanitized = sanitized.split(apiKey).join('[REDACTED]');
+  }
+  if (senderEmail) {
+    sanitized = sanitized.split(senderEmail).join('[REDACTED_SENDER]');
+  }
+
+  sanitized = sanitized.replace(/xkeysib-[A-Za-z0-9._-]+/gi, '[REDACTED_BREVO_KEY]');
+  sanitized = sanitized.replace(/(api-key\s*[:=]\s*)([^\s,;]+)/gi, '$1[REDACTED]');
+  sanitized = sanitized.replace(/(Bearer\s+)([^\s,;]+)/gi, '$1[REDACTED]');
+  return sanitized;
+}
+
+export function formatBrevoApiError(err: unknown): string {
   const errObj = (err && typeof err === 'object' ? err : {}) as {
+    status?: unknown;
     code?: unknown;
-    responseCode?: unknown;
-    command?: unknown;
+    name?: unknown;
     message?: unknown;
+    cause?: unknown;
   };
 
-  const code = typeof errObj.code === 'string' ? errObj.code : '';
-  const responseCode = typeof errObj.responseCode === 'number' ? errObj.responseCode : null;
-  let rawMessage = err instanceof Error ? err.message : String(err || 'Unknown SMTP error');
-  if (password) {
-    rawMessage = rawMessage.split(password).join('[REDACTED]');
-  }
-  if (user) {
-    rawMessage = rawMessage.split(user).join('[REDACTED]');
-  }
+  const status = typeof errObj.status === 'number' ? errObj.status : null;
+  const causeObj = (errObj.cause && typeof errObj.cause === 'object' ? errObj.cause : {}) as {
+    code?: unknown;
+  };
+  const code =
+    typeof errObj.code === 'string'
+      ? errObj.code
+      : typeof causeObj.code === 'string'
+        ? causeObj.code
+        : '';
+  const name = typeof errObj.name === 'string' ? errObj.name : err instanceof Error ? err.name : '';
+  const rawMessage = redactEmailSecrets(
+    err instanceof Error
+      ? err.message
+      : typeof errObj.message === 'string'
+        ? errObj.message
+        : String(err || 'Unknown Brevo email delivery error')
+  );
 
   if (
-    code === 'EAUTH' ||
-    responseCode === 535 ||
-    responseCode === 534 ||
-    /Username and Password not accepted|Authentication failed|Invalid login/i.test(rawMessage)
-  ) {
-    return 'SMTP authentication failed (535/EAUTH). Verify SMTP_USER and SMTP_PASSWORD for your configured SMTP provider.';
-  }
-
-  if (/WRONG_VERSION_NUMBER|TLS|SSL|certificate/i.test(rawMessage)) {
-    return `SMTP TLS/STARTTLS negotiation failed on ${host || 'unset'}:${port || 'unset'}. For port 587 use STARTTLS (secure=false), or use port 465 for implicit TLS.`;
-  }
-
-  if (
+    name === 'TimeoutError' ||
+    name === 'AbortError' ||
     code === 'ETIMEDOUT' ||
-    code === 'ESOCKET' ||
-    code === 'ECONNECTION' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    code === 'UND_ERR_HEADERS_TIMEOUT' ||
+    code === 'UND_ERR_BODY_TIMEOUT' ||
+    /timed?\s*out|aborted due to timeout|ETIMEDOUT/i.test(rawMessage)
+  ) {
+    return 'Email delivery request to Brevo timed out. Please try again in a moment.';
+  }
+
+  if (status === 401 || status === 403) {
+    return `Brevo API authentication or authorization failed (HTTP ${status}). Verify server-side BREVO_API_KEY and sender permissions.`;
+  }
+
+  if (status === 400) {
+    return 'Brevo rejected the email payload (HTTP 400). Verify BREVO_SENDER_EMAIL is an authorized sender and the recipient address is valid.';
+  }
+
+  if (status === 404) {
+    return 'Brevo transactional email endpoint was not found (HTTP 404). Verify the Brevo API configuration.';
+  }
+
+  if (status === 429) {
+    return 'Brevo email rate limit or sending quota exceeded (HTTP 429). Please retry shortly.';
+  }
+
+  if (status !== null && status >= 500) {
+    return `Brevo email service is temporarily unavailable (HTTP ${status}). Please try again later.`;
+  }
+
+  if (status !== null && status >= 400) {
+    return `Brevo email delivery failed with HTTP ${status}.`;
+  }
+
+  if (
+    err instanceof SyntaxError ||
+    /invalid json|unexpected token|unexpected response payload/i.test(rawMessage)
+  ) {
+    return 'Brevo returned an invalid or unexpected JSON response. Please verify email delivery configuration.';
+  }
+
+  if (
     code === 'ECONNREFUSED' ||
     code === 'ENOTFOUND' ||
     code === 'EAI_AGAIN' ||
-    /timeout|ECONNREFUSED|ENOTFOUND|ETIMEDOUT/i.test(rawMessage)
+    code === 'ECONNRESET' ||
+    code === 'EHOSTUNREACH' ||
+    code === 'ENETUNREACH' ||
+    /fetch failed|network error|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET/i.test(rawMessage)
   ) {
-    return `Unable to connect to SMTP server ${host || 'unset'}:${port || 'unset'} (${code || 'network error'}). Check SMTP_HOST, SMTP_PORT, and outbound network access.`;
+    return `Unable to reach Brevo email API over HTTPS (${code || 'network error'}). Check outbound HTTPS connectivity and try again.`;
   }
 
-  if (code === 'EENVELOPE' || responseCode === 550 || responseCode === 553 || responseCode === 554) {
-    return 'SMTP server rejected the sender or recipient address. Ensure SMTP_FROM uses an authorized sender address for your SMTP provider.';
-  }
-
-  return `SMTP delivery error (${code || responseCode || 'transport'}): ${rawMessage}`;
-}
-
-export function getTransporter(): Transporter {
-  const validation = validateSmtpConfig();
-  if (!validation.configured) {
-    throw new Error(validation.error || `Email service is not configured. Missing: ${validation.missing.join(', ')}.`);
-  }
-
-  const { host, port, user, password, secure, requireTLS } = getSmtpSettings();
-  const passwordDigest = crypto.createHash('sha256').update(password).digest('hex').slice(0, 12);
-  const key = `${host}:${port}:${user}:${secure ? '1' : '0'}:${requireTLS ? '1' : '0'}:${passwordDigest}`;
-
-  if (!cachedTransporter || cachedTransporterKey !== key) {
-    const factory: CreateTransportFn =
-      testCreateTransport || ((opts) => nodemailer.createTransport(opts as TransportOptions));
-
-    cachedTransporter = factory({
-      host,
-      port,
-      secure,
-      requireTLS,
-      auth: {
-        user,
-        pass: password,
-      },
-      connectionTimeout: 10_000,
-      greetingTimeout: 10_000,
-      socketTimeout: 15_000,
-    });
-    cachedTransporterKey = key;
-  }
-  return cachedTransporter;
+  return `Brevo email delivery error: ${rawMessage.slice(0, 240)}`;
 }
 
 export function resolveAppBaseUrl(requestOrigin?: string): string {
@@ -331,26 +360,93 @@ function renderInkloomEmailLayout(params: {
 </html>`;
 }
 
-export async function sendEmail(message: EmailMessage): Promise<void> {
+export async function sendEmail(message: EmailMessage): Promise<EmailSendResult> {
   if (testEmailSender) {
-    await testEmailSender(message);
-    return;
+    const result = await testEmailSender(message);
+    return result && typeof result === 'object' ? result : {};
   }
 
-  const { from } = getSmtpSettings();
-  const transporter = getTransporter();
+  const validation = validateEmailConfig();
+  if (!validation.configured) {
+    throw new Error(
+      validation.error || `Email service is not configured. Missing: ${validation.missing.join(', ')}.`
+    );
+  }
 
+  const { apiKey, senderEmail, senderName } = getEmailSettings();
+  const fetchImpl = testFetch || fetch;
+
+  let response: Response;
   try {
-    await transporter.sendMail({
-      from,
-      to: message.to,
-      subject: message.subject,
-      html: message.html,
-      text: message.text,
+    response = await fetchImpl(BREVO_API_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'api-key': apiKey,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        sender: {
+          name: senderName,
+          email: senderEmail,
+        },
+        to: [{ email: message.to }],
+        subject: message.subject,
+        htmlContent: message.html,
+        textContent: message.text,
+      }),
+      signal: AbortSignal.timeout(BREVO_TIMEOUT_MS),
     });
   } catch (err) {
-    throw new Error(formatSmtpError(err));
+    throw new Error(formatBrevoApiError(err));
   }
+
+  let rawBody = '';
+  try {
+    rawBody = await response.text();
+  } catch (err) {
+    if (!response.ok) {
+      throw new Error(formatBrevoApiError({ status: response.status }));
+    }
+    throw new Error(formatBrevoApiError(err));
+  }
+
+  if (!response.ok) {
+    throw new Error(formatBrevoApiError({ status: response.status, message: rawBody }));
+  }
+
+  const trimmed = rawBody.trim();
+  if (!trimmed) {
+    if (response.status === 204) {
+      return {};
+    }
+    throw new Error(
+      formatBrevoApiError({ message: 'Unexpected empty JSON response payload from Brevo' })
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    throw new Error(formatBrevoApiError(err));
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(
+      formatBrevoApiError({ message: 'Unexpected response payload shape from Brevo' })
+    );
+  }
+
+  const data = parsed as { messageId?: unknown; messageIds?: unknown };
+  if (typeof data.messageId === 'string' && data.messageId.trim()) {
+    return { messageId: data.messageId.trim() };
+  }
+  if (Array.isArray(data.messageIds) && typeof data.messageIds[0] === 'string' && data.messageIds[0].trim()) {
+    return { messageId: data.messageIds[0].trim() };
+  }
+
+  return {};
 }
 
 export async function sendVerificationEmail(params: {
@@ -359,7 +455,7 @@ export async function sendVerificationEmail(params: {
   companyName: string;
   verificationUrl: string;
   expiresHours: number;
-}): Promise<void> {
+}): Promise<EmailSendResult> {
   const safeCompany = escapeHtml(params.companyName);
   const bodyHtml = `
     <p style="margin: 0 0 12px 0;">
@@ -392,7 +488,7 @@ export async function sendVerificationEmail(params: {
     'If you did not create this account, you can safely ignore this email.',
   ].join('\n');
 
-  await sendEmail({
+  return await sendEmail({
     to: params.to,
     subject: 'Verify your email address — InkloomGuard AI',
     html,
@@ -405,7 +501,7 @@ export async function sendPasswordResetEmail(params: {
   name: string;
   resetUrl: string;
   expiresMinutes: number;
-}): Promise<void> {
+}): Promise<EmailSendResult> {
   const bodyHtml = `
     <p style="margin: 0 0 12px 0;">
       We received a request to reset the password for your <strong>InkloomGuard AI</strong> account.
@@ -437,7 +533,7 @@ export async function sendPasswordResetEmail(params: {
     'If you did not request a password reset, you can safely ignore this email.',
   ].join('\n');
 
-  await sendEmail({
+  return await sendEmail({
     to: params.to,
     subject: 'Reset your password — InkloomGuard AI',
     html,
@@ -450,7 +546,7 @@ export async function sendPasswordChangedEmail(params: {
   name: string;
   companyName: string;
   changedAtIso: string;
-}): Promise<void> {
+}): Promise<EmailSendResult> {
   const safeCompany = escapeHtml(params.companyName);
   const safeTimestamp = escapeHtml(new Date(params.changedAtIso).toUTCString());
   const bodyHtml = `
@@ -482,7 +578,7 @@ export async function sendPasswordChangedEmail(params: {
     'If you did not make this change, reset your password immediately.',
   ].join('\n');
 
-  await sendEmail({
+  return await sendEmail({
     to: params.to,
     subject: 'Your password was changed — InkloomGuard AI',
     html,

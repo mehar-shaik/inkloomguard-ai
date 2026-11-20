@@ -27,7 +27,7 @@ import {
   type AuthedRequest,
 } from './auth.ts';
 import {
-  isSmtpConfigured,
+  isEmailConfigured,
   buildAppActionUrl,
   sendVerificationEmail,
   sendPasswordResetEmail,
@@ -360,7 +360,7 @@ export function createApiRouter(): express.Router {
         storageConfigured: storage.configured,
         storageBucket: storage.bucket,
         geminiConfigured,
-        emailConfigured: isSmtpConfigured(),
+        emailConfigured: isEmailConfigured(),
         demoAvailable: !isProductionEnvironment(),
         timestamp: new Date().toISOString(),
       });
@@ -386,7 +386,7 @@ export function createApiRouter(): express.Router {
         let verificationEmailError: string | undefined;
         try {
           const { rawToken, expiresHours } = await createEmailVerificationToken(user.id, user.companyId);
-          if (isSmtpConfigured()) {
+          if (isEmailConfigured()) {
             const verificationUrl = buildAppActionUrl(
               `/?mode=verify-email&token=${encodeURIComponent(rawToken)}`,
               getRequestOrigin(req)
@@ -400,12 +400,12 @@ export function createApiRouter(): express.Router {
             });
             verificationEmailSent = true;
           } else {
-            verificationEmailError = 'Email delivery (SMTP) is not configured yet.';
+            verificationEmailError = 'Email delivery is not configured yet.';
           }
         } catch (emailErr) {
           console.error(
             '[InkloomGuard AI] Verification email dispatch error during registration:',
-            emailErr instanceof Error ? emailErr.message : 'SMTP error'
+            emailErr instanceof Error ? emailErr.message : 'Email delivery error'
           );
           verificationEmailError = 'Verification email could not be sent automatically. You can resend it from Settings.';
         }
@@ -519,8 +519,8 @@ export function createApiRouter(): express.Router {
       try {
         const created = await createPasswordResetToken(email, req.ip || '');
         if (created) {
-          if (!isSmtpConfigured()) {
-            console.error('[InkloomGuard AI] Password reset requested but SMTP email service is not configured.');
+          if (!isEmailConfigured()) {
+            console.error('[InkloomGuard AI] Password reset requested but email delivery service is not configured.');
           } else {
             const resetUrl = buildAppActionUrl(
               `/?mode=reset-password&token=${encodeURIComponent(created.rawToken)}`,
@@ -579,7 +579,7 @@ export function createApiRouter(): express.Router {
           newPassword: String(newPassword),
         });
 
-        if (isSmtpConfigured()) {
+        if (isEmailConfigured()) {
           await sendPasswordChangedEmail({
             to: result.user.email,
             name: result.user.name,
@@ -635,9 +635,9 @@ export function createApiRouter(): express.Router {
     '/auth/resend-verification',
     resendVerificationRateLimit,
     asyncHandler(async (req, res) => {
-      if (!isSmtpConfigured()) {
+      if (!isEmailConfigured()) {
         res.status(503).json({
-          error: 'Email service is not configured. Please configure SMTP settings before sending verification emails.',
+          error: 'Email service is not configured. Please configure Brevo email settings before sending verification emails.',
         });
         return;
       }
@@ -752,7 +752,7 @@ export function createApiRouter(): express.Router {
         });
 
         let confirmationEmailSent = false;
-        if (isSmtpConfigured()) {
+        if (isEmailConfigured()) {
           try {
             await sendPasswordChangedEmail({
               to: result.user.email,

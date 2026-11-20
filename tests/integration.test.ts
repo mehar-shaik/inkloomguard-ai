@@ -20,11 +20,9 @@ delete process.env.SUPABASE_SERVICE_ROLE_KEY;
 delete process.env.SUPABASE_STORAGE_BUCKET;
 delete process.env.GEMINI_API_KEY;
 delete process.env.GEMINI_MODEL;
-delete process.env.SMTP_HOST;
-delete process.env.SMTP_PORT;
-delete process.env.SMTP_USER;
-delete process.env.SMTP_PASSWORD;
-delete process.env.SMTP_FROM;
+delete process.env.BREVO_API_KEY;
+delete process.env.BREVO_SENDER_EMAIL;
+delete process.env.BREVO_SENDER_NAME;
 
 const { createApp, isAllowedOrigin } = await import('../server.ts');
 const {
@@ -36,12 +34,14 @@ const {
 } = await import('../server/db.ts');
 const { authAttempts, pruneAuthAttempts } = await import('../server/routes.ts');
 const {
-  setCreateTransportForTesting,
+  BREVO_API_ENDPOINT,
+  DEFAULT_BREVO_SENDER_NAME,
+  setFetchForTesting,
   resetEmailSenderForTesting,
-  validateSmtpConfig,
-  getSmtpDiagnostics,
-  formatSmtpError,
-  getTransporter,
+  validateEmailConfig,
+  isEmailConfigured,
+  getEmailDiagnostics,
+  formatBrevoApiError,
   sendEmail,
 } = await import('../server/email.ts');
 const {
@@ -272,127 +272,208 @@ async function runUnitChecks() {
   );
   assert.equal(extractDevPostgresFallbackReason(new Error('syntax error at or near "SELECT"')), null);
 
-  // SMTP validation (Brevo + port 587 STARTTLS + port 465 TLS + invalid rejection), diagnostics safety, and provider-neutral error formatting checks
-  const unconfiguredSmtp = validateSmtpConfig();
-  assert.equal(unconfiguredSmtp.configured, false);
-  assert.deepEqual(unconfiguredSmtp.missing, [
-    'SMTP_HOST',
-    'SMTP_PORT',
-    'SMTP_USER',
-    'SMTP_PASSWORD',
-    'SMTP_FROM',
-  ]);
+  // Brevo HTTPS transactional email validation, diagnostics safety, payload/headers, timeout, HTTP error handling & secret redaction
+  const unconfiguredEmail = validateEmailConfig();
+  assert.equal(unconfiguredEmail.configured, false);
+  assert.equal(isEmailConfigured(), false);
+  assert.deepEqual(unconfiguredEmail.missing, ['BREVO_API_KEY', 'BREVO_SENDER_EMAIL']);
 
-  const syntheticSmtpFixture = ['fixture', 'smtp', 'redact', 'check'].join('-');
-  const syntheticRelayUser = 'test-relay-account.example';
+  const syntheticBrevoKey = ['mock', 'brevo', 'api', 'key', '0001'].join('-');
+  const syntheticXkeysibShape = ['xkeysib', 'citest', '000000', 'mockredact'].join('-');
+  const syntheticSenderEmail = 'noreply@example.test';
 
-  // Invalid SMTP configurations (port out of range, YOUR_*/REPLACE_WITH_* placeholders, invalid FROM) must be rejected cleanly
-  process.env.SMTP_HOST = 'smtp-relay.brevo.com';
-  process.env.SMTP_PORT = '99999';
-  process.env.SMTP_USER = 'YOUR_SMTP_LOGIN';
-  process.env.SMTP_PASSWORD = 'REPLACE_WITH_YOUR_SMTP_PASSWORD';
-  process.env.SMTP_FROM = 'invalid-from-without-at';
-  const invalidSmtp = validateSmtpConfig();
-  assert.equal(invalidSmtp.configured, false);
-  assert.deepEqual(invalidSmtp.missing, ['SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM']);
+  // Placeholder values and malformed sender emails must be rejected cleanly
+  process.env.BREVO_API_KEY = 'REPLACE_WITH_YOUR_BREVO_API_KEY';
+  process.env.BREVO_SENDER_EMAIL = 'invalid-sender-without-at';
+  const invalidEmailConfig = validateEmailConfig();
+  assert.equal(invalidEmailConfig.configured, false);
+  assert.deepEqual(invalidEmailConfig.missing, ['BREVO_API_KEY', 'BREVO_SENDER_EMAIL']);
 
-  // Valid Brevo SMTP configuration on port 587 (STARTTLS: secure=false, requireTLS=true)
-  process.env.SMTP_HOST = 'smtp-relay.brevo.com';
-  process.env.SMTP_PORT = '587';
-  process.env.SMTP_USER = syntheticRelayUser;
-  process.env.SMTP_PASSWORD = syntheticSmtpFixture;
-  process.env.SMTP_FROM = 'InkloomGuard AI <noreply@example.test>';
-  const brevoValid = validateSmtpConfig();
-  assert.equal(brevoValid.configured, true);
-  assert.deepEqual(brevoValid.missing, []);
+  process.env.BREVO_API_KEY = syntheticBrevoKey;
+  process.env.BREVO_SENDER_EMAIL = syntheticSenderEmail;
+  delete process.env.BREVO_SENDER_NAME;
 
-  const unitCapturedTransports: Array<Record<string, unknown>> = [];
-  setCreateTransportForTesting((options) => {
-    unitCapturedTransports.push(options);
-    return { sendMail: async () => ({ messageId: '<unit-mock@example.test>' }) } as unknown as import('nodemailer').Transporter;
-  });
+  const validEmailConfig = validateEmailConfig();
+  assert.equal(validEmailConfig.configured, true);
+  assert.equal(isEmailConfigured(), true);
+  assert.deepEqual(validEmailConfig.missing, []);
+
+  const emailDiag = getEmailDiagnostics();
+  assert.equal(emailDiag.configured, true);
+  assert.equal(emailDiag.provider, 'brevo-https');
+  assert.equal(emailDiag.endpoint, 'https://api.brevo.com/v3/smtp/email');
+  assert.equal(emailDiag.apiKeyConfigured, true);
+  assert.equal(emailDiag.senderEmailConfigured, true);
+  assert.equal(emailDiag.senderName, DEFAULT_BREVO_SENDER_NAME);
+  assert.equal(JSON.stringify(emailDiag).includes(syntheticBrevoKey), false);
+  assert.equal(JSON.stringify(emailDiag).includes(syntheticSenderEmail), false);
+
+  const unitFetchCalls: Array<{
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body: Record<string, any>;
+    hasSignal: boolean;
+  }> = [];
 
   try {
-    getTransporter();
-    assert.equal(unitCapturedTransports.length, 1);
-    assert.equal(unitCapturedTransports[0].host, 'smtp-relay.brevo.com');
-    assert.equal(unitCapturedTransports[0].port, 587);
-    assert.equal(unitCapturedTransports[0].secure, false);
-    assert.equal(unitCapturedTransports[0].requireTLS, true);
+    setFetchForTesting(async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const headers = Object.fromEntries(new Headers(init?.headers).entries());
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, any>;
+      unitFetchCalls.push({
+        url,
+        method: String(init?.method || 'GET'),
+        headers,
+        body,
+        hasSignal: init?.signal instanceof AbortSignal,
+      });
+      return new Response(JSON.stringify({ messageId: '<unit-brevo-1@example.test>' }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
 
-    const diag587 = getSmtpDiagnostics();
-    assert.equal(diag587.configured, true);
-    assert.equal(diag587.host, 'smtp-relay.brevo.com');
-    assert.equal(diag587.port, 587);
-    assert.equal(diag587.secure, false);
-    assert.equal(diag587.starttls, true);
-    assert.equal(JSON.stringify(diag587).includes(syntheticSmtpFixture), false);
-    assert.equal(JSON.stringify(diag587).includes(syntheticRelayUser), false);
+    const sendRes = await sendEmail({
+      to: 'recipient@example.test',
+      subject: 'Unit Verification',
+      html: '<p>Hello</p>',
+      text: 'Hello',
+    });
+    assert.equal(sendRes.messageId, '<unit-brevo-1@example.test>');
+    assert.equal(unitFetchCalls.length, 1);
+    assert.equal(unitFetchCalls[0].url, BREVO_API_ENDPOINT);
+    assert.equal(unitFetchCalls[0].method, 'POST');
+    assert.equal(unitFetchCalls[0].headers['api-key'], syntheticBrevoKey);
+    assert.equal(unitFetchCalls[0].headers['content-type'], 'application/json');
+    assert.equal(unitFetchCalls[0].headers['accept'], 'application/json');
+    assert.equal(unitFetchCalls[0].hasSignal, true);
+    assert.deepEqual(unitFetchCalls[0].body, {
+      sender: { name: 'InkloomGuard AI', email: syntheticSenderEmail },
+      to: [{ email: 'recipient@example.test' }],
+      subject: 'Unit Verification',
+      htmlContent: '<p>Hello</p>',
+      textContent: 'Hello',
+    });
 
-    // Port 465 uses implicit TLS (secure=true, requireTLS=false)
-    process.env.SMTP_PORT = '465';
-    getTransporter();
-    assert.equal(unitCapturedTransports.length, 2);
-    assert.equal(unitCapturedTransports[1].port, 465);
-    assert.equal(unitCapturedTransports[1].secure, true);
-    assert.equal(unitCapturedTransports[1].requireTLS, false);
+    // Respect custom BREVO_SENDER_NAME
+    process.env.BREVO_SENDER_NAME = 'InkloomGuard Security';
+    await sendEmail({
+      to: 'recipient@example.test',
+      subject: 'Custom Sender',
+      html: '<p>Hi</p>',
+      text: 'Hi',
+    });
+    assert.equal(unitFetchCalls[1].body.sender.name, 'InkloomGuard Security');
+    delete process.env.BREVO_SENDER_NAME;
 
-    const diag465 = getSmtpDiagnostics();
-    assert.equal(diag465.port, 465);
-    assert.equal(diag465.secure, true);
-    assert.equal(diag465.starttls, false);
+    // Non-2xx HTTP status handling without leaking raw provider response or API key
+    for (const [status, pattern] of [
+      [400, /HTTP 400|rejected the email payload/i],
+      [401, /HTTP 401|authentication or authorization failed/i],
+      [403, /HTTP 403|authentication or authorization failed/i],
+      [404, /HTTP 404|not found/i],
+      [429, /HTTP 429|rate limit/i],
+      [500, /HTTP 500|temporarily unavailable/i],
+      [503, /HTTP 503|temporarily unavailable/i],
+    ] as const) {
+      setFetchForTesting(async () =>
+        new Response(
+          JSON.stringify({
+            message: `Provider failure ${syntheticBrevoKey} ${syntheticXkeysibShape} ${syntheticSenderEmail}`,
+          }),
+          { status, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+      await assert.rejects(
+        () =>
+          sendEmail({
+            to: 'recipient@example.test',
+            subject: 'Err',
+            html: '<p>Err</p>',
+            text: 'Err',
+          }),
+        (err: Error) => {
+          assert.match(err.message, pattern);
+          assert.ok(!err.message.includes(syntheticBrevoKey));
+          assert.ok(!err.message.includes(syntheticXkeysibShape));
+          assert.ok(!err.message.includes(syntheticSenderEmail));
+          return true;
+        }
+      );
+    }
 
-    // Transporter cache reuses identical config and refreshes when SMTP settings change
-    getTransporter();
-    assert.equal(unitCapturedTransports.length, 2);
-
-    process.env.SMTP_PASSWORD = ['fixture', 'smtp', 'rotated', '0002'].join('-');
-    getTransporter();
-    assert.equal(unitCapturedTransports.length, 3);
-
-    process.env.SMTP_HOST = 'smtp.example.test';
-    getTransporter();
-    assert.equal(unitCapturedTransports.length, 4);
-
-    // Provider-neutral errors + credential redaction (never exposes password or username)
-    process.env.SMTP_HOST = 'smtp-relay.brevo.com';
-    process.env.SMTP_PORT = '587';
-    process.env.SMTP_PASSWORD = syntheticSmtpFixture;
-    const authErrMsg = formatSmtpError(
-      Object.assign(new Error(`Invalid login for ${syntheticRelayUser} with ${syntheticSmtpFixture}`), {
-        code: 'EAUTH',
-        responseCode: 535,
-      })
+    // Timeout error must NOT auto-retry POST request
+    let timeoutAttempts = 0;
+    setFetchForTesting(async () => {
+      timeoutAttempts += 1;
+      throw Object.assign(new Error(`Request timed out with ${syntheticBrevoKey}`), { name: 'TimeoutError' });
+    });
+    await assert.rejects(
+      () =>
+        sendEmail({
+          to: 'recipient@example.test',
+          subject: 'Timeout',
+          html: '<p>Timeout</p>',
+          text: 'Timeout',
+        }),
+      (err: Error) => {
+        assert.match(err.message, /timed out/i);
+        assert.ok(!err.message.includes(syntheticBrevoKey));
+        return true;
+      }
     );
-    assert.match(authErrMsg, /SMTP authentication failed/i);
-    assert.equal(/Gmail|App Password/i.test(authErrMsg), false);
-    assert.ok(!authErrMsg.includes(syntheticSmtpFixture));
-    assert.ok(!authErrMsg.includes(syntheticRelayUser));
+    assert.equal(timeoutAttempts, 1);
 
-    const timeoutErrMsg = formatSmtpError(
-      Object.assign(new Error(`Connection timeout for ${syntheticRelayUser}`), { code: 'ETIMEDOUT' })
+    // Network failure
+    setFetchForTesting(async () => {
+      throw Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error(`connect ECONNRESET ${syntheticBrevoKey}`), { code: 'ECONNRESET' }),
+      });
+    });
+    await assert.rejects(
+      () =>
+        sendEmail({
+          to: 'recipient@example.test',
+          subject: 'Net',
+          html: '<p>Net</p>',
+          text: 'Net',
+        }),
+      (err: Error) => {
+        assert.match(err.message, /Unable to reach Brevo email API over HTTPS/i);
+        assert.ok(!err.message.includes(syntheticBrevoKey));
+        return true;
+      }
     );
-    assert.match(timeoutErrMsg, /Unable to connect to SMTP server/i);
-    assert.ok(!timeoutErrMsg.includes(syntheticRelayUser));
 
-    const tlsErrMsg = formatSmtpError(
-      new Error(`ssl3_get_record:wrong version number WRONG_VERSION_NUMBER ${syntheticSmtpFixture}`)
+    // Invalid / non-JSON 200 response
+    setFetchForTesting(async () => new Response('<html>Bad Upstream</html>', { status: 200 }));
+    await assert.rejects(
+      () =>
+        sendEmail({
+          to: 'recipient@example.test',
+          subject: 'BadJson',
+          html: '<p>BadJson</p>',
+          text: 'BadJson',
+        }),
+      (err: Error) => {
+        assert.match(err.message, /invalid or unexpected JSON response/i);
+        return true;
+      }
     );
-    assert.match(tlsErrMsg, /STARTTLS|secure=false/i);
-    assert.ok(!tlsErrMsg.includes(syntheticSmtpFixture));
 
-    const envelopeErrMsg = formatSmtpError(
-      Object.assign(new Error(`Sender rejected for ${syntheticRelayUser}`), { code: 'EENVELOPE', responseCode: 550 })
+    // Direct formatBrevoApiError secret redaction check
+    const redactedErr = formatBrevoApiError(
+      new Error(`Unexpected failure api-key=${syntheticBrevoKey} token=${syntheticXkeysibShape} sender=${syntheticSenderEmail}`)
     );
-    assert.match(envelopeErrMsg, /authorized sender address/i);
-    assert.equal(/Gmail/i.test(envelopeErrMsg), false);
+    assert.ok(!redactedErr.includes(syntheticBrevoKey));
+    assert.ok(!redactedErr.includes(syntheticXkeysibShape));
+    assert.ok(!redactedErr.includes(syntheticSenderEmail));
   } finally {
     resetEmailSenderForTesting();
-    delete process.env.SMTP_HOST;
-    delete process.env.SMTP_PORT;
-    delete process.env.SMTP_USER;
-    delete process.env.SMTP_PASSWORD;
-    delete process.env.SMTP_FROM;
+    delete process.env.BREVO_API_KEY;
+    delete process.env.BREVO_SENDER_EMAIL;
+    delete process.env.BREVO_SENDER_NAME;
   }
 
   // Compliance engine without Gemini API key marks aiStatus='partial', never 'completed'
@@ -1138,42 +1219,82 @@ async function main() {
     const revokedMe = await req('/api/auth/me', { headers: authHdr(revToken) });
     assert.equal(revokedMe.status, 401);
 
-    // 9. Authentication & Account Security Workflows (Mocked Nodemailer Brevo SMTP Transporter — zero real emails sent)
-    const mockSmtpFixture = ['fixture', 'relay', 'auth', '0001'].join('-');
+    // 9. Authentication & Account Security Workflows (Mocked Brevo Transactional Email HTTPS API — zero real emails sent)
+    const mockBrevoKey = ['mock', 'brevo', 'api', 'key', '0002'].join('-');
     const mockSenderAddress = 'mock-sender@example.test';
-    const mockFromHeader = `InkloomGuard AI <${mockSenderAddress}>`;
+    const mockSenderName = 'InkloomGuard AI';
 
     try {
-      process.env.SMTP_HOST = 'smtp-relay.brevo.com';
-      process.env.SMTP_PORT = '587';
-      process.env.SMTP_USER = mockSenderAddress;
-      process.env.SMTP_PASSWORD = mockSmtpFixture;
-      process.env.SMTP_FROM = mockFromHeader;
+      process.env.BREVO_API_KEY = mockBrevoKey;
+      process.env.BREVO_SENDER_EMAIL = mockSenderAddress;
+      process.env.BREVO_SENDER_NAME = mockSenderName;
 
-      const smtpDiag = getSmtpDiagnostics();
-      assert.equal(smtpDiag.configured, true);
-      assert.equal(smtpDiag.host, 'smtp-relay.brevo.com');
-      assert.equal(smtpDiag.port, 587);
-      assert.equal(smtpDiag.secure, false);
-      assert.equal(smtpDiag.starttls, true);
-      assert.ok(!JSON.stringify(smtpDiag).includes(mockSmtpFixture));
-      assert.ok(!JSON.stringify(smtpDiag).includes(mockSenderAddress));
+      const emailDiag = getEmailDiagnostics();
+      assert.equal(emailDiag.configured, true);
+      assert.equal(emailDiag.provider, 'brevo-https');
+      assert.equal(emailDiag.endpoint, BREVO_API_ENDPOINT);
+      assert.equal(emailDiag.apiKeyConfigured, true);
+      assert.equal(emailDiag.senderEmailConfigured, true);
+      assert.equal(emailDiag.senderName, mockSenderName);
+      assert.ok(!JSON.stringify(emailDiag).includes(mockBrevoKey));
+      assert.ok(!JSON.stringify(emailDiag).includes(mockSenderAddress));
 
-      const capturedTransportOptions: Array<Record<string, unknown>> = [];
-      const sentEmails: Array<{ from?: string; to: string; subject: string; html: string; text: string }> = [];
-      let smtpErrorToThrow: Error | null = null;
+      const configuredHealth = await req('/api/health');
+      assert.equal(configuredHealth.status, 200);
+      assert.equal(configuredHealth.json!.emailConfigured, true);
+      assert.ok(!configuredHealth.text.includes(mockBrevoKey));
+      assert.ok(!configuredHealth.text.includes(mockSenderAddress));
 
-      setCreateTransportForTesting((options) => {
-        capturedTransportOptions.push(options);
-        return {
-          sendMail: async (mail: { from?: string; to: string; subject: string; html: string; text: string }) => {
-            if (smtpErrorToThrow) {
-              throw smtpErrorToThrow;
-            }
-            sentEmails.push(mail);
-            return { messageId: `<mock-${sentEmails.length}@relay.test>` };
-          },
-        } as unknown as import('nodemailer').Transporter;
+      const capturedBrevoRequests: Array<{
+        url: string;
+        method: string;
+        headers: Record<string, string>;
+      }> = [];
+      const sentEmails: Array<{
+        sender: { name: string; email: string };
+        to: Array<{ email: string }>;
+        subject: string;
+        html: string;
+        text: string;
+      }> = [];
+      let brevoFailureResponse: { status: number; body: string } | null = null;
+
+      setFetchForTesting(async (input, init) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        const headers = Object.fromEntries(new Headers(init?.headers).entries());
+        capturedBrevoRequests.push({
+          url,
+          method: String(init?.method || 'GET'),
+          headers,
+        });
+
+        if (brevoFailureResponse) {
+          return new Response(brevoFailureResponse.body, {
+            status: brevoFailureResponse.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        const parsedBody = JSON.parse(String(init?.body || '{}')) as {
+          sender: { name: string; email: string };
+          to: Array<{ email: string }>;
+          subject: string;
+          htmlContent: string;
+          textContent: string;
+        };
+
+        sentEmails.push({
+          sender: parsedBody.sender,
+          to: parsedBody.to,
+          subject: parsedBody.subject,
+          html: parsedBody.htmlContent,
+          text: parsedBody.textContent,
+        });
+
+        return new Response(JSON.stringify({ messageId: `<mock-brevo-${sentEmails.length}@relay.test>` }), {
+          status: 201,
+          headers: { 'Content-Type': 'application/json' },
+        });
       });
 
       // 9a. Weak password rejected on registration
@@ -1196,7 +1317,7 @@ async function main() {
       assert.equal(demoLoginRes.json!.user.emailVerified, false);
       assert.equal(demoLoginRes.json!.user.verificationRequired, false);
 
-      // 9c. Registration sends verification email via Brevo SMTP Nodemailer, stores ONLY token hash, and verifies once
+      // 9c. Registration sends verification email via Brevo HTTPS API, stores ONLY token hash, and verifies once
       sentEmails.length = 0;
       const secRegRes = await req('/api/auth/register', {
         method: 'POST',
@@ -1212,17 +1333,15 @@ async function main() {
       assert.equal(secRegRes.status, 201);
       assert.equal(secRegRes.json!.verificationEmailSent, true);
       assert.equal(secRegRes.json!.user.emailVerified, false);
-      assert.equal(capturedTransportOptions.length, 1);
-      assert.equal(capturedTransportOptions[0].host, 'smtp-relay.brevo.com');
-      assert.equal(capturedTransportOptions[0].port, 587);
-      assert.equal(capturedTransportOptions[0].secure, false);
-      assert.equal(capturedTransportOptions[0].requireTLS, true);
-      assert.deepEqual(capturedTransportOptions[0].auth, {
-        user: mockSenderAddress,
-        pass: mockSmtpFixture,
-      });
+      assert.equal(capturedBrevoRequests.length, 1);
+      assert.equal(capturedBrevoRequests[0].url, 'https://api.brevo.com/v3/smtp/email');
+      assert.equal(capturedBrevoRequests[0].method, 'POST');
+      assert.equal(capturedBrevoRequests[0].headers['api-key'], mockBrevoKey);
+      assert.equal(capturedBrevoRequests[0].headers['content-type'], 'application/json');
+      assert.equal(capturedBrevoRequests[0].headers['accept'], 'application/json');
       assert.equal(sentEmails.length, 1);
-      assert.equal(sentEmails[0].from, mockFromHeader);
+      assert.deepEqual(sentEmails[0].sender, { name: mockSenderName, email: mockSenderAddress });
+      assert.deepEqual(sentEmails[0].to, [{ email: 'sam.security@novapay-ci.test' }]);
       assert.match(sentEmails[0].html, /InkloomGuard AI/);
       assert.match(sentEmails[0].html, /Check\. Correct\. Comply\./);
       const verifyMatch = sentEmails[0].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
@@ -1253,7 +1372,7 @@ async function main() {
       assert.equal(expiredVerifyRes.status, 400);
       assert.equal(expiredVerifyRes.json!.reason, 'expired');
 
-      // Resend verification creates a fresh token & succeeds via same SMTP transporter
+      // Resend verification creates a fresh token & succeeds via Brevo HTTPS API
       let samToken = secRegRes.json!.token as string;
       sentEmails.length = 0;
       const resendVerifyRes = await req('/api/auth/resend-verification', {
@@ -1263,20 +1382,17 @@ async function main() {
       });
       assert.equal(resendVerifyRes.status, 200);
       assert.equal(sentEmails.length, 1);
-      assert.equal(sentEmails[0].from, mockFromHeader);
-      assert.equal(capturedTransportOptions.length, 1); // Reused singleton transporter
+      assert.deepEqual(sentEmails[0].sender, { name: mockSenderName, email: mockSenderAddress });
+      assert.equal(capturedBrevoRequests.length, 2);
       const freshVerifyMatch = sentEmails[0].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
       assert.ok(freshVerifyMatch && freshVerifyMatch[1]);
       const freshVerifyToken = freshVerifyMatch[1];
 
-      // SMTP failure reporting: formats EAUTH clearly in a provider-neutral way without leaking secrets
-      smtpErrorToThrow = Object.assign(
-        new Error(`535-5.7.8 Authentication failed for ${mockSenderAddress} ${mockSmtpFixture}`),
-        {
-          code: 'EAUTH',
-          responseCode: 535,
-        }
-      );
+      // Brevo API failure reporting: formats HTTP 401 clearly without leaking secrets
+      brevoFailureResponse = {
+        status: 401,
+        body: JSON.stringify({ code: 'unauthorized', message: `Key not valid: ${mockBrevoKey} for ${mockSenderAddress}` }),
+      };
       await assert.rejects(
         () =>
           sendEmail({
@@ -1286,9 +1402,8 @@ async function main() {
             text: 'Test',
           }),
         (err: Error) => {
-          assert.match(err.message, /SMTP authentication failed/i);
-          assert.equal(/Gmail/i.test(err.message), false);
-          assert.ok(!err.message.includes(mockSmtpFixture));
+          assert.match(err.message, /Brevo API authentication or authorization failed \(HTTP 401\)/i);
+          assert.ok(!err.message.includes(mockBrevoKey));
           assert.ok(!err.message.includes(mockSenderAddress));
           return true;
         }
@@ -1300,10 +1415,10 @@ async function main() {
         body: JSON.stringify({}),
       });
       assert.equal(failResendRes.status, 503);
-      assert.ok(!failResendRes.text.includes(mockSmtpFixture));
+      assert.ok(!failResendRes.text.includes(mockBrevoKey));
       assert.ok(!failResendRes.text.includes(mockSenderAddress));
-      assert.ok(!failResendRes.text.includes('535-5.7.8'));
-      smtpErrorToThrow = null;
+      assert.ok(!failResendRes.text.includes('Key not valid'));
+      brevoFailureResponse = null;
 
       // Resend verification rate limiting (3 attempts per 15 min -> 4th returns 429)
       const resend3 = await req('/api/auth/resend-verification', {
@@ -1568,8 +1683,7 @@ async function main() {
       });
       assert.equal(resetOk.status, 200);
       assert.equal(sentEmails.length, 1);
-      assert.equal(sentEmails[0].from, mockFromHeader);
-      assert.equal(capturedTransportOptions.length, 1);
+      assert.deepEqual(sentEmails[0].sender, { name: mockSenderName, email: mockSenderAddress });
       assert.match(sentEmails[0].subject, /password was changed/i);
 
       // Previous active session is now invalidated
@@ -1628,11 +1742,9 @@ async function main() {
       assert.equal(usersCountAfter?.c, usersCountBefore?.c);
     } finally {
       resetEmailSenderForTesting();
-      delete process.env.SMTP_HOST;
-      delete process.env.SMTP_PORT;
-      delete process.env.SMTP_USER;
-      delete process.env.SMTP_PASSWORD;
-      delete process.env.SMTP_FROM;
+      delete process.env.BREVO_API_KEY;
+      delete process.env.BREVO_SENDER_EMAIL;
+      delete process.env.BREVO_SENDER_NAME;
     }
 
     // 10. Production Security Audit Regressions
@@ -2015,11 +2127,9 @@ async function main() {
     resetAiClientFactoryForTesting();
     resetEmailSenderForTesting();
     delete process.env.GEMINI_TIMEOUT_MS;
-    delete process.env.SMTP_HOST;
-    delete process.env.SMTP_PORT;
-    delete process.env.SMTP_USER;
-    delete process.env.SMTP_PASSWORD;
-    delete process.env.SMTP_FROM;
+    delete process.env.BREVO_API_KEY;
+    delete process.env.BREVO_SENDER_EMAIL;
+    delete process.env.BREVO_SENDER_NAME;
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (typeof app.locals.closeResources === 'function') {
       await (app.locals.closeResources as () => Promise<void>)();

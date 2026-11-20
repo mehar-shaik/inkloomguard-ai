@@ -5,7 +5,7 @@ import path from 'node:path';
 import type http from 'node:http';
 import { initDatabase, closeDatabase, DB_ENGINE, isProductionEnvironment } from './server/db.ts';
 import { getStorageMode, getStorageStatus } from './server/storage.ts';
-import { logSmtpStartupDiagnostics } from './server/email.ts';
+import { logEmailStartupDiagnostics } from './server/email.ts';
 import { resolveGeminiTimeoutMs } from './server/complianceEngine.ts';
 import { createApiRouter } from './server/routes.ts';
 
@@ -136,7 +136,7 @@ async function startServer() {
     console.log(
       `InkloomGuard AI server listening on port ${PORT} (db=${DB_ENGINE}, storage=${storage.mode}${storage.bucket ? `:${storage.bucket}` : ''})`
     );
-    logSmtpStartupDiagnostics();
+    logEmailStartupDiagnostics();
   });
 
   const geminiTimeoutMs = resolveGeminiTimeoutMs();
