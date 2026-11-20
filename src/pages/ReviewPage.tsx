@@ -3,6 +3,7 @@ import { CheckCircle2, AlertTriangle, XCircle, MessageSquarePlus } from 'lucide-
 import { api } from '../api';
 import type { ComplianceIssue, PageKey, ReviewEvent, Submission } from '../types';
 import { EmptyState, LoadingPanel, ProtectedImage, StatusBadge } from '../components/ClayUI';
+import { formatDateTime } from '../utils/date';
 
 export function ReviewPage({
   userRole = 'reviewer',
@@ -38,7 +39,9 @@ export function ReviewPage({
           : listRes.submissions[0]?.id || null;
 
       if (idToLoad) {
-        onSelectSubmission(idToLoad);
+        if (idToLoad !== selectedSubmissionId) {
+          onSelectSubmission(idToLoad);
+        }
         const detail = await api.getSubmissionDetail(idToLoad);
         setSubmission(detail.submission);
         setIssues(detail.issues);
@@ -265,7 +268,7 @@ export function ReviewPage({
                     </div>
                     {ev.comment && <p className="text-xs text-slate-600 dark:text-slate-300">{ev.comment}</p>}
                     <p className="font-mono-tabular text-[11px] text-slate-400 mt-1.5">
-                      {new Date(ev.created_at + 'Z').toLocaleString()}
+                      {formatDateTime(ev.created_at)}
                     </p>
                   </div>
                 ))}

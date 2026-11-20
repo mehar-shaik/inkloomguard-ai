@@ -1,16 +1,25 @@
 import React, { useState } from 'react';
-import { ArrowRight, Lock, Mail, Building2, UserCheck, Shield } from 'lucide-react';
+import { ArrowRight, Mail, Building2, UserCheck, Shield } from 'lucide-react';
 import { api } from '../api';
 import { ThemeToggle } from '../components/ClayUI';
+import { PasswordField } from '../components/PasswordField';
+import { evaluatePasswordStrength } from '../utils/password';
 import shieldEmblem from '/src/assets/images/inkloom_shield_emblem_1794725371250.jpg';
 
 export function AuthPage({
   onAuthSuccess,
+  onForgotPassword,
+  onResendVerification,
   theme,
   onToggleTheme,
   sessionNotice,
 }: {
-  onAuthSuccess: (token: string) => Promise<void>;
+  onAuthSuccess: (
+    token: string,
+    meta?: { verificationEmailSent?: boolean; verificationEmailError?: string }
+  ) => Promise<void>;
+  onForgotPassword: () => void;
+  onResendVerification: () => void;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
   sessionNotice?: string;
@@ -27,6 +36,15 @@ export function AuthPage({
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError('');
+
+    if (mode === 'register') {
+      const strength = evaluatePasswordStrength(password);
+      if (!strength.isValid) {
+        setError(`Password does not meet security requirements: ${strength.errors.join(', ')}.`);
+        return;
+      }
+    }
+
     setLoading(true);
     try {
       const res =
@@ -36,7 +54,10 @@ export function AuthPage({
       if (!res.token) {
         throw new Error('Authentication server did not issue a session token.');
       }
-      await onAuthSuccess(res.token);
+      await onAuthSuccess(res.token, {
+        verificationEmailSent: res.verificationEmailSent,
+        verificationEmailError: res.verificationEmailError,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Authentication failed.');
     } finally {
@@ -166,12 +187,16 @@ export function AuthPage({
             {mode === 'register' && (
               <>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5">
+                  <label
+                    htmlFor="auth-full-name"
+                    className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5"
+                  >
                     Full Name
                   </label>
                   <div className="relative">
-                    <UserCheck className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2" />
+                    <UserCheck className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
                     <input
+                      id="auth-full-name"
                       type="text"
                       required
                       value={name}
@@ -184,12 +209,16 @@ export function AuthPage({
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5">
+                    <label
+                      htmlFor="auth-company-name"
+                      className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5"
+                    >
                       Company / Organization
                     </label>
                     <div className="relative">
-                      <Building2 className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2" />
+                      <Building2 className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
                       <input
+                        id="auth-company-name"
                         type="text"
                         required
                         value={companyName}
@@ -200,10 +229,14 @@ export function AuthPage({
                     </div>
                   </div>
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5">
+                    <label
+                      htmlFor="auth-role"
+                      className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5"
+                    >
                       Workspace Role
                     </label>
                     <select
+                      id="auth-role"
                       value={role}
                       onChange={(e) => setRole(e.target.value as 'reviewer' | 'author')}
                       className="clay-well w-full rounded-2xl px-4 py-3 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
@@ -217,14 +250,19 @@ export function AuthPage({
             )}
 
             <div>
-              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5">
+              <label
+                htmlFor="auth-email"
+                className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5"
+              >
                 Work Email
               </label>
               <div className="relative">
-                <Mail className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2" />
+                <Mail className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
+                  id="auth-email"
                   type="email"
                   required
+                  autoComplete="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="name@company.com"
@@ -233,22 +271,35 @@ export function AuthPage({
               </div>
             </div>
 
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5">
-                Password
-              </label>
-              <div className="relative">
-                <Lock className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2" />
-                <input
-                  type="password"
-                  required
-                  minLength={6}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Minimum 6 characters"
-                  className="clay-well w-full rounded-2xl pl-11 pr-4 py-3 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
-                />
-              </div>
+            <div className="space-y-1.5">
+              <PasswordField
+                id="auth-password"
+                label="Password"
+                value={password}
+                onChange={setPassword}
+                placeholder={mode === 'register' ? 'Minimum 8 characters with A-Z, 0-9, symbol' : 'Enter your password'}
+                autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
+                showStrength={mode === 'register'}
+                disabled={loading}
+              />
+              {mode === 'login' && (
+                <div className="flex items-center justify-between pt-0.5">
+                  <button
+                    type="button"
+                    onClick={onResendVerification}
+                    className="text-xs font-semibold text-slate-500 hover:text-indigo-600 dark:text-slate-400 dark:hover:text-violet-300 cursor-pointer"
+                  >
+                    Resend verification email
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onForgotPassword}
+                    className="text-xs font-bold text-indigo-600 hover:text-indigo-700 dark:text-violet-300 dark:hover:text-violet-200 cursor-pointer"
+                  >
+                    Forgot Password?
+                  </button>
+                </div>
+              )}
             </div>
 
             {error && (
@@ -285,7 +336,7 @@ export function AuthPage({
       </main>
 
       <footer className="max-w-6xl w-full mx-auto text-center text-xs text-slate-500 dark:text-slate-400 relative z-10">
-        InkloomGuard AI · Multi-Tenant Brand Compliance Platform
+        InkloomGuard AI · Check. Correct. Comply.
       </footer>
     </div>
   );

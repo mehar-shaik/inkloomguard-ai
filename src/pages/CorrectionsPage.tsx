@@ -37,7 +37,9 @@ export function CorrectionsPage({
           : listRes.submissions[0]?.id || null;
 
       if (idToLoad) {
-        onSelectSubmission(idToLoad);
+        if (idToLoad !== selectedSubmissionId) {
+          onSelectSubmission(idToLoad);
+        }
         const detail = await api.getSubmissionDetail(idToLoad);
         setSubmission(detail.submission);
         setIssues(detail.issues);

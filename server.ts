@@ -3,31 +3,42 @@ import express from 'express';
 import cookieParser from 'cookie-parser';
 import path from 'node:path';
 import type http from 'node:http';
-import { initDatabase, closeDatabase, DB_ENGINE } from './server/db.ts';
+import { initDatabase, closeDatabase, DB_ENGINE, isProductionEnvironment } from './server/db.ts';
 import { getStorageMode, getStorageStatus } from './server/storage.ts';
+import { logSmtpStartupDiagnostics } from './server/email.ts';
+import { resolveGeminiTimeoutMs } from './server/complianceEngine.ts';
 import { createApiRouter } from './server/routes.ts';
 
-function isAllowedOrigin(origin: string): boolean {
-  const configured = [process.env.APP_URL, process.env.RENDER_EXTERNAL_URL]
+export function isAllowedOrigin(origin: string): boolean {
+  const normalizedOrigin = origin.trim().replace(/\/+$/, '');
+  if (!normalizedOrigin) return false;
+
+  const configured = [
+    process.env.APP_URL,
+    process.env.APP_BASE_URL,
+    process.env.RENDER_EXTERNAL_URL,
+  ]
     .filter((v): v is string => Boolean(v && v.trim()))
     .map((v) => v.trim().replace(/\/+$/, ''));
-  if (configured.includes(origin.replace(/\/+$/, ''))) return true;
+  if (configured.includes(normalizedOrigin)) return true;
 
   const extraOrigins = (process.env.CORS_ORIGINS || '')
     .split(',')
     .map((o) => o.trim().replace(/\/+$/, ''))
     .filter(Boolean);
-  if (extraOrigins.includes(origin.replace(/\/+$/, ''))) return true;
+  if (extraOrigins.includes(normalizedOrigin)) return true;
 
-  try {
-    const parsed = new URL(origin);
-    if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') return true;
-    if (parsed.hostname.endsWith('.run.app')) return true;
-    if (parsed.hostname.endsWith('.onrender.com')) return true;
-    if (parsed.hostname === 'aistudio.google.com') return true;
-  } catch {
-    return false;
+  if (!isProductionEnvironment()) {
+    try {
+      const parsed = new URL(normalizedOrigin);
+      if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') {
+        return true;
+      }
+    } catch {
+      return false;
+    }
   }
+
   return false;
 }
 
@@ -51,7 +62,7 @@ export async function createApp(): Promise<express.Express> {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Idempotency-Key');
       res.setHeader('Access-Control-Allow-Credentials', 'true');
     }
     if (req.method === 'OPTIONS') {
@@ -83,8 +94,13 @@ export async function createApp(): Promise<express.Express> {
     };
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
+    app.use(express.static(distPath, { maxAge: '1h' }));
+    app.get('*', (req, res) => {
+      // Never serve index.html as a false 200 fallback for missing static file requests
+      if (path.extname(req.path)) {
+        res.status(404).send('Not found.');
+        return;
+      }
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -110,14 +126,23 @@ export async function createApp(): Promise<express.Express> {
 
 async function startServer() {
   const app = await createApp();
-  const PORT = Number(process.env.PORT) || 3000;
+  const isProduction = isProductionEnvironment();
+  const PORT = isProduction
+    ? Number(process.env.PORT) || 3000
+    : Number(process.env.DEV_PORT) || 3000;
   const storage = getStorageStatus();
 
   const server: http.Server = app.listen(PORT, '0.0.0.0', () => {
     console.log(
       `InkloomGuard AI server listening on port ${PORT} (db=${DB_ENGINE}, storage=${storage.mode}${storage.bucket ? `:${storage.bucket}` : ''})`
     );
+    logSmtpStartupDiagnostics();
   });
+
+  const geminiTimeoutMs = resolveGeminiTimeoutMs();
+  server.requestTimeout = Math.max(150_000, geminiTimeoutMs + 30_000);
+  server.headersTimeout = 35_000;
+  server.keepAliveTimeout = 65_000;
 
   let shuttingDown = false;
   const gracefulShutdown = async (signal: string) => {

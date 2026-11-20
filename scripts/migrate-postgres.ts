@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { initDatabase, closeDatabase, DB_ENGINE } from '../server/db.ts';
 
 async function main() {
+  process.env.INKLOOM_STRICT_POSTGRES = 'true';
   if (DB_ENGINE !== 'postgres') {
     console.error('DATABASE_URL is not set. Set DATABASE_URL to run PostgreSQL migrations.');
     process.exit(1);

@@ -8,6 +8,7 @@ import { inferMimeType, getStorageMode } from '../server/storage.ts';
 import { createClient } from '@supabase/supabase-js';
 
 async function migrateSqliteToPostgres() {
+  process.env.INKLOOM_STRICT_POSTGRES = 'true';
   const databaseUrl = process.env.DATABASE_URL?.trim();
   if (!databaseUrl || DB_ENGINE !== 'postgres') {
     console.error('ERROR: DATABASE_URL must be set to your Supabase PostgreSQL connection string.');
@@ -56,15 +57,39 @@ async function migrateSqliteToPostgres() {
       );
     }
 
-    const users = sqlite
-      .prepare('SELECT id, company_id, name, email, password_hash, role, created_at FROM users ORDER BY id ASC')
-      .all() as Array<Record<string, unknown>>;
+    const toPgBool = (v: unknown) => v === true || v === 1 || v === '1' || v === 'true';
+
+    const users = sqlite.prepare('SELECT * FROM users ORDER BY id ASC').all() as Array<Record<string, unknown>>;
     for (const u of users) {
       await client.query(
-        `INSERT INTO users (id, company_id, name, email, password_hash, role, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
+        `INSERT INTO users (
+           id, company_id, name, email, password_hash, role,
+           avatar_filename, avatar_original_name, job_title, bio, preferences_json,
+           email_verified, email_verified_at, verification_required, token_version, password_updated_at,
+           updated_at, created_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, $14, $15, $16::timestamptz, $17::timestamptz, $18::timestamptz)
          ON CONFLICT (email) DO NOTHING`,
-        [u.id, u.company_id, u.name, u.email, u.password_hash, u.role, u.created_at]
+        [
+          u.id,
+          u.company_id,
+          u.name,
+          u.email,
+          u.password_hash,
+          u.role,
+          u.avatar_filename ?? null,
+          u.avatar_original_name ?? null,
+          u.job_title ?? '',
+          u.bio ?? '',
+          u.preferences_json ?? '{}',
+          toPgBool(u.email_verified),
+          u.email_verified_at ?? null,
+          toPgBool(u.verification_required),
+          Number(u.token_version ?? 1),
+          u.password_updated_at ?? null,
+          u.updated_at || u.created_at,
+          u.created_at,
+        ]
       );
     }
 
@@ -92,73 +117,106 @@ async function migrateSqliteToPostgres() {
       );
     }
 
-    const docs = sqlite
-      .prepare(
-        'SELECT id, company_id, brand_id, filename, original_name, file_type, extracted_text, uploaded_by, created_at FROM guideline_documents ORDER BY id ASC'
-      )
-      .all() as Array<Record<string, unknown>>;
+    const docs = sqlite.prepare('SELECT * FROM guideline_documents ORDER BY id ASC').all() as Array<Record<string, unknown>>;
     for (const d of docs) {
       await client.query(
-        `INSERT INTO guideline_documents (id, company_id, brand_id, filename, original_name, file_type, extracted_text, uploaded_by, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz)
+        `INSERT INTO guideline_documents (
+           id, company_id, brand_id, filename, original_name, file_type, extracted_text, uploaded_by,
+           content_hash, extracted_rules_json, extracted_at, extraction_status, extraction_error, page_count, created_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz, $12, $13, $14, $15::timestamptz)
          ON CONFLICT (id) DO NOTHING`,
-        [d.id, d.company_id, d.brand_id, d.filename, d.original_name, d.file_type, d.extracted_text, d.uploaded_by, d.created_at]
+        [
+          d.id,
+          d.company_id,
+          d.brand_id,
+          d.filename,
+          d.original_name,
+          d.file_type,
+          d.extracted_text,
+          d.uploaded_by ?? null,
+          d.content_hash ?? null,
+          d.extracted_rules_json ?? null,
+          d.extracted_at ?? null,
+          d.extraction_status ?? 'pending',
+          d.extraction_error ?? null,
+          Number(d.page_count ?? 1),
+          d.created_at,
+        ]
       );
     }
 
-    const facts = sqlite
-      .prepare('SELECT id, company_id, brand_id, fact_key, fact_value, source_doc, created_at FROM approved_facts ORDER BY id ASC')
-      .all() as Array<Record<string, unknown>>;
+    const facts = sqlite.prepare('SELECT * FROM approved_facts ORDER BY id ASC').all() as Array<Record<string, unknown>>;
     for (const f of facts) {
       await client.query(
-        `INSERT INTO approved_facts (id, company_id, brand_id, fact_key, fact_value, source_doc, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
+        `INSERT INTO approved_facts (
+           id, company_id, brand_id, fact_key, fact_value, source_doc,
+           source_document_id, source_page, source_section, source_excerpt, created_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz)
          ON CONFLICT (id) DO NOTHING`,
-        [f.id, f.company_id, f.brand_id, f.fact_key, f.fact_value, f.source_doc, f.created_at]
+        [
+          f.id,
+          f.company_id,
+          f.brand_id,
+          f.fact_key,
+          f.fact_value,
+          f.source_doc,
+          f.source_document_id ?? null,
+          f.source_page ?? null,
+          f.source_section ?? '',
+          f.source_excerpt ?? '',
+          f.created_at,
+        ]
       );
     }
 
-    const terms = sqlite
-      .prepare(
-        'SELECT id, company_id, brand_id, prohibited_term, preferred_term, severity, notes, created_at FROM terminology_rules ORDER BY id ASC'
-      )
-      .all() as Array<Record<string, unknown>>;
+    const terms = sqlite.prepare('SELECT * FROM terminology_rules ORDER BY id ASC').all() as Array<Record<string, unknown>>;
     for (const t of terms) {
       await client.query(
-        `INSERT INTO terminology_rules (id, company_id, brand_id, prohibited_term, preferred_term, severity, notes, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz)
+        `INSERT INTO terminology_rules (
+           id, company_id, brand_id, prohibited_term, preferred_term, severity, notes,
+           source_document_id, source_page, source_section, source_excerpt, created_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::timestamptz)
          ON CONFLICT (id) DO NOTHING`,
-        [t.id, t.company_id, t.brand_id, t.prohibited_term, t.preferred_term, t.severity, t.notes, t.created_at]
+        [
+          t.id,
+          t.company_id,
+          t.brand_id,
+          t.prohibited_term,
+          t.preferred_term,
+          t.severity,
+          t.notes,
+          t.source_document_id ?? null,
+          t.source_page ?? null,
+          t.source_section ?? '',
+          t.source_excerpt ?? '',
+          t.created_at,
+        ]
       );
     }
 
-    const rules = sqlite
-      .prepare('SELECT id, company_id, brand_id, tone_rules, messaging_rules, updated_at FROM brand_rules ORDER BY id ASC')
-      .all() as Array<Record<string, unknown>>;
+    const rules = sqlite.prepare('SELECT * FROM brand_rules ORDER BY id ASC').all() as Array<Record<string, unknown>>;
     for (const r of rules) {
       await client.query(
-        `INSERT INTO brand_rules (id, company_id, brand_id, tone_rules, messaging_rules, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6::timestamptz)
+        `INSERT INTO brand_rules (id, company_id, brand_id, tone_rules, messaging_rules, source_document_id, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
          ON CONFLICT (brand_id) DO NOTHING`,
-        [r.id, r.company_id, r.brand_id, r.tone_rules, r.messaging_rules, r.updated_at]
+        [r.id, r.company_id, r.brand_id, r.tone_rules, r.messaging_rules, r.source_document_id ?? null, r.updated_at]
       );
     }
 
-    const submissions = sqlite
-      .prepare(
-        `SELECT id, company_id, brand_id, submitted_by, title, input_type, original_content, revised_content,
-                file_filename, file_original_name, image_filename, image_alt_text, status, checks_summary_json,
-                image_metrics_json, created_at, updated_at
-         FROM submissions ORDER BY id ASC`
-      )
-      .all() as Array<Record<string, unknown>>;
+    const submissions = sqlite.prepare('SELECT * FROM submissions ORDER BY id ASC').all() as Array<Record<string, unknown>>;
     for (const s of submissions) {
       await client.query(
         `INSERT INTO submissions (
           id, company_id, brand_id, submitted_by, title, input_type, original_content, revised_content,
-          file_filename, file_original_name, image_filename, image_alt_text, status, checks_summary_json,
-          image_metrics_json, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::timestamptz, $17::timestamptz)
+          file_filename, file_original_name, image_filename, image_alt_text, status,
+          compliance_score, analysis_coverage, ai_status, ai_error,
+          request_idempotency_key, content_hash, analysis_stage, analysis_timings_json,
+          checks_summary_json, image_metrics_json, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::timestamptz, $25::timestamptz)
         ON CONFLICT (id) DO NOTHING`,
         [
           s.id,
@@ -174,6 +232,14 @@ async function migrateSqliteToPostgres() {
           s.image_filename,
           s.image_alt_text,
           s.status,
+          s.compliance_score ?? null,
+          s.analysis_coverage ?? null,
+          s.ai_status ?? 'completed',
+          s.ai_error ?? null,
+          s.request_idempotency_key ?? null,
+          s.content_hash ?? null,
+          s.analysis_stage ?? 'completed',
+          s.analysis_timings_json ?? null,
           s.checks_summary_json,
           s.image_metrics_json,
           s.created_at,
@@ -220,21 +286,28 @@ async function migrateSqliteToPostgres() {
         `INSERT INTO revisions (id, company_id, submission_id, edited_by, content, note, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
          ON CONFLICT (id) DO NOTHING`,
-        [rev.id, rev.company_id, rev.submission_id, rev.edited_by, rev.content, rev.note, rev.created_at]
+        [rev.id, rev.company_id, rev.submission_id, rev.edited_by ?? null, rev.content, rev.note, rev.created_at]
       );
     }
 
-    const reviewEvents = sqlite
-      .prepare(
-        'SELECT id, company_id, submission_id, reviewer_id, reviewer_name, decision, comment, created_at FROM review_events ORDER BY id ASC'
-      )
-      .all() as Array<Record<string, unknown>>;
+    const reviewEvents = sqlite.prepare('SELECT * FROM review_events ORDER BY id ASC').all() as Array<Record<string, unknown>>;
     for (const ev of reviewEvents) {
       await client.query(
-        `INSERT INTO review_events (id, company_id, submission_id, reviewer_id, reviewer_name, decision, comment, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz)
+        `INSERT INTO review_events (id, company_id, submission_id, reviewer_id, reviewer_name, decision, previous_status, new_status, comment, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz)
          ON CONFLICT (id) DO NOTHING`,
-        [ev.id, ev.company_id, ev.submission_id, ev.reviewer_id, ev.reviewer_name, ev.decision, ev.comment, ev.created_at]
+        [
+          ev.id,
+          ev.company_id,
+          ev.submission_id,
+          ev.reviewer_id ?? null,
+          ev.reviewer_name,
+          ev.decision,
+          ev.previous_status ?? '',
+          ev.new_status ?? '',
+          ev.comment,
+          ev.created_at,
+        ]
       );
     }
 

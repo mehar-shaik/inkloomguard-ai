@@ -5,7 +5,8 @@ export type PageKey =
   | 'analysis'
   | 'corrections'
   | 'review'
-  | 'history';
+  | 'history'
+  | 'settings';
 
 export interface AuthUser {
   id: number;
@@ -14,6 +15,11 @@ export interface AuthUser {
   name: string;
   email: string;
   role: string;
+  emailVerified?: boolean;
+  emailVerifiedAt?: string | null;
+  verificationRequired?: boolean;
+  passwordUpdatedAt?: string | null;
+  tokenVersion?: number;
 }
 
 export interface Brand {
@@ -38,6 +44,10 @@ export interface GuidelineDocument {
   original_name: string;
   file_type: string;
   extracted_text: string;
+  page_count?: number | null;
+  extraction_status?: 'pending' | 'completed' | 'failed';
+  extraction_error?: string | null;
+  extracted_at?: string | null;
   created_at: string;
 }
 
@@ -47,6 +57,10 @@ export interface ApprovedFact {
   fact_key: string;
   fact_value: string;
   source_doc: string;
+  source_document_id?: number | null;
+  source_page?: number | null;
+  source_section?: string;
+  source_excerpt?: string;
   created_at: string;
 }
 
@@ -57,11 +71,49 @@ export interface TerminologyRule {
   preferred_term: string;
   severity: 'critical' | 'high' | 'medium' | 'low';
   notes: string;
+  source_document_id?: number | null;
+  source_page?: number | null;
+  source_section?: string;
+  source_excerpt?: string;
+}
+
+export interface ExtractedFactProposal {
+  fact_key: string;
+  fact_value: string;
+  source_page?: number | null;
+  source_section?: string;
+  source_excerpt?: string;
+}
+
+export interface ExtractedTerminologyProposal {
+  prohibited_term: string;
+  preferred_term: string;
+  severity: string;
+  notes: string;
+  source_page?: number | null;
+  source_section?: string;
+  source_excerpt?: string;
+}
+
+export interface ExtractedGuidelinesPayload {
+  toneRules: string;
+  messagingRules: string;
+  facts: ExtractedFactProposal[];
+  terminology: ExtractedTerminologyProposal[];
+}
+
+export interface GuidelineConflict {
+  type: 'fact_conflict' | 'terminology_conflict';
+  key: string;
+  existingValue: string;
+  incomingValue: string;
+  message: string;
 }
 
 export interface BrandRules {
   tone_rules: string;
   messaging_rules: string;
+  source_document_id?: number | null;
   updated_at?: string;
 }
 
@@ -85,6 +137,10 @@ export interface ImageMetrics {
   dominantColors: string[];
   averageLuminance: number;
   contrastSpread: number;
+  wcagContrastRatio?: number | null;
+  wcagAA?: boolean | null;
+  wcagAALarge?: boolean | null;
+  wcagAAA?: boolean | null;
   brandPrimaryMatchDistance: number | null;
   brandSecondaryMatchDistance: number | null;
   closestBrandHexMatch: string | null;
@@ -109,6 +165,10 @@ export interface Submission {
   image_filename: string | null;
   image_alt_text: string;
   status: string;
+  compliance_score?: number | null;
+  analysis_coverage?: number | null;
+  ai_status?: 'completed' | 'partial' | 'failed' | 'pending';
+  ai_error?: string | null;
   checks_summary_json: string;
   image_metrics_json: string | null;
   total_issues?: number;
@@ -148,6 +208,8 @@ export interface ReviewEvent {
   reviewer_name: string;
   decision: string;
   comment: string;
+  previous_status?: string | null;
+  new_status?: string | null;
   created_at: string;
 }
 
@@ -165,6 +227,8 @@ export interface DashboardData {
     reviewer_name: string;
     decision: string;
     comment: string;
+    previous_status?: string | null;
+    new_status?: string | null;
     created_at: string;
     submission_title: string;
     brand_name: string;

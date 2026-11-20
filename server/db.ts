@@ -1,11 +1,18 @@
 import { DatabaseSync } from 'node:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Pool, types } from 'pg';
 import path from 'node:path';
 import fs from 'node:fs';
 import bcrypt from 'bcryptjs';
 
-// Parse PostgreSQL BIGINT (OID 20) as JS Number so IDs/counts remain numeric across Postgres and SQLite
-types.setTypeParser(20, (val: string) => Number(val));
+// Parse PostgreSQL BIGINT (OID 20) safely as JS Number within safe integer bounds
+types.setTypeParser(20, (val: string) => {
+  const num = Number(val);
+  if (!Number.isSafeInteger(num)) {
+    throw new RangeError(`PostgreSQL BIGINT value exceeds JS MAX_SAFE_INTEGER: ${val}`);
+  }
+  return num;
+});
 
 export const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
@@ -20,40 +27,136 @@ export interface RunResult {
   lastInsertRowid?: number;
 }
 
-export interface DbClient {
-  engine: DbEngine;
+export interface DbTx {
   get<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T | undefined>;
   all<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T[]>;
   run(sql: string, ...params: unknown[]): Promise<RunResult>;
   insert(sql: string, ...params: unknown[]): Promise<number>;
+}
+
+export interface DbClient extends DbTx {
+  engine: DbEngine;
   exec(sql: string): Promise<void>;
+  transaction<T>(fn: (tx: DbTx) => Promise<T>): Promise<T>;
   close(): Promise<void>;
 }
 
-function convertPlaceholdersToPg(sql: string): string {
+export function convertPlaceholdersToPg(sql: string): string {
   let index = 0;
-  let inSingleQuote = false;
   let result = '';
+  let i = 0;
 
-  for (let i = 0; i < sql.length; i++) {
+  while (i < sql.length) {
     const ch = sql[i];
-    if (ch === "'" && sql[i - 1] !== '\\') {
-      if (inSingleQuote && sql[i + 1] === "'") {
-        result += "''";
-        i++;
-        continue;
+    const next = sql[i + 1];
+
+    // Single-line comment -- ... \n
+    if (ch === '-' && next === '-') {
+      const end = sql.indexOf('\n', i + 2);
+      if (end === -1) {
+        result += sql.slice(i);
+        break;
       }
-      inSingleQuote = !inSingleQuote;
-      result += ch;
+      result += sql.slice(i, end + 1);
+      i = end + 1;
       continue;
     }
-    if (ch === '?' && !inSingleQuote) {
+
+    // Block comment /* ... */ (supports nesting)
+    if (ch === '/' && next === '*') {
+      let depth = 1;
+      let j = i + 2;
+      while (j < sql.length && depth > 0) {
+        if (sql[j] === '/' && sql[j + 1] === '*') {
+          depth++;
+          j += 2;
+        } else if (sql[j] === '*' && sql[j + 1] === '/') {
+          depth--;
+          j += 2;
+        } else {
+          j++;
+        }
+      }
+      result += sql.slice(i, j);
+      i = j;
+      continue;
+    }
+
+    // Single-quoted string literal '...' (handling '' escapes)
+    if (ch === "'") {
+      let j = i + 1;
+      while (j < sql.length) {
+        if (sql[j] === "'" && sql[j + 1] === "'") {
+          j += 2;
+          continue;
+        }
+        if (sql[j] === "'") {
+          j++;
+          break;
+        }
+        j++;
+      }
+      result += sql.slice(i, j);
+      i = j;
+      continue;
+    }
+
+    // Double-quoted identifier "..." (handling "" escapes)
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < sql.length) {
+        if (sql[j] === '"' && sql[j + 1] === '"') {
+          j += 2;
+          continue;
+        }
+        if (sql[j] === '"') {
+          j++;
+          break;
+        }
+        j++;
+      }
+      result += sql.slice(i, j);
+      i = j;
+      continue;
+    }
+
+    // Dollar-quoted block $tag$...$tag$
+    if (ch === '$') {
+      const tagMatch = sql.slice(i).match(/^\$([A-Za-z_][A-Za-z0-9_]*)?\$/);
+      if (tagMatch) {
+        const tag = tagMatch[0];
+        const closeIdx = sql.indexOf(tag, i + tag.length);
+        if (closeIdx !== -1) {
+          const end = closeIdx + tag.length;
+          result += sql.slice(i, end);
+          i = end;
+          continue;
+        }
+      }
+    }
+
+    // Parameter placeholder ? (avoid PostgreSQL JSONB ?| and ?& operators)
+    if (ch === '?') {
+      if (next === '|' || next === '&') {
+        result += ch + next;
+        i += 2;
+        continue;
+      }
+      if (next === '?') {
+        result += '?';
+        i += 2;
+        continue;
+      }
       index++;
       result += `$${index}`;
-    } else {
-      result += ch;
+      i++;
+      continue;
     }
+
+    result += ch;
+    i++;
   }
+
   return result;
 }
 
@@ -79,17 +182,26 @@ function shouldUsePgSsl(connectionString: string): boolean {
 let sqliteInstance: DatabaseSync | null = null;
 let pgPool: Pool | null = null;
 let initialized = false;
+let migrationsReady = false;
+
+export function isMigrationsReady(): boolean {
+  return migrationsReady;
+}
+
+export function isProductionEnvironment(): boolean {
+  return process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
+}
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
-const isProductionRuntime = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
+const isProductionRuntime = isProductionEnvironment();
 
-if (isProductionRuntime && !databaseUrl && process.env.ALLOW_LOCAL_SQLITE_FALLBACK !== 'true') {
+if (isProductionRuntime && !databaseUrl) {
   throw new Error(
-    'DATABASE_URL must be configured in production (Supabase PostgreSQL). Local SQLite in DATA_DIR is disabled in production.'
+    'DATABASE_URL must be configured in production (Supabase PostgreSQL). Local SQLite in DATA_DIR is strictly disabled in production.'
   );
 }
 
-export const DB_ENGINE: DbEngine = databaseUrl ? 'postgres' : 'sqlite';
+export let DB_ENGINE: DbEngine = databaseUrl ? 'postgres' : 'sqlite';
 
 function ensureLocalDataDirs(): void {
   if (!fs.existsSync(DATA_DIR)) {
@@ -120,17 +232,18 @@ function getPgPool(): Pool {
       connectionString: databaseUrl,
       max: 5,
       idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 10_000,
+      connectionTimeoutMillis: 5_000,
       ssl: shouldUsePgSsl(databaseUrl) ? { rejectUnauthorized: false } : false,
+    });
+    pgPool.on('error', (err) => {
+      console.error('[InkloomGuard AI] PostgreSQL pool error:', err instanceof Error ? err.message : String(err));
     });
   }
   return pgPool;
 }
 
-export const db: DbClient =
-  DB_ENGINE === 'postgres'
-    ? {
-        engine: 'postgres',
+const pgClient: DbClient = {
+  engine: 'postgres',
         async get<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T | undefined> {
           const pgSql = convertPlaceholdersToPg(sql);
           const res = await getPgPool().query(pgSql, normalizePgParams(params));
@@ -157,14 +270,58 @@ export const db: DbClient =
         async exec(sql: string): Promise<void> {
           await getPgPool().query(sql);
         },
+        async transaction<T>(fn: (tx: DbTx) => Promise<T>): Promise<T> {
+          const client = await getPgPool().connect();
+          const tx: DbTx = {
+            async get<R = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<R | undefined> {
+              const pgSql = convertPlaceholdersToPg(sql);
+              const res = await client.query(pgSql, normalizePgParams(params));
+              return res.rows[0] as R | undefined;
+            },
+            async all<R = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<R[]> {
+              const pgSql = convertPlaceholdersToPg(sql);
+              const res = await client.query(pgSql, normalizePgParams(params));
+              return res.rows as R[];
+            },
+            async run(sql: string, ...params: unknown[]): Promise<RunResult> {
+              const pgSql = convertPlaceholdersToPg(sql);
+              const res = await client.query(pgSql, normalizePgParams(params));
+              return { changes: res.rowCount ?? 0 };
+            },
+            async insert(sql: string, ...params: unknown[]): Promise<number> {
+              const trimmed = sql.trim().replace(/;$/, '');
+              const withReturning = /\bRETURNING\b/i.test(trimmed) ? trimmed : `${trimmed} RETURNING id`;
+              const pgSql = convertPlaceholdersToPg(withReturning);
+              const res = await client.query(pgSql, normalizePgParams(params));
+              const row = res.rows[0] as { id?: string | number } | undefined;
+              return Number(row?.id ?? 0);
+            },
+          };
+          try {
+            await client.query('BEGIN');
+            const result = await fn(tx);
+            await client.query('COMMIT');
+            return result;
+          } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+          } finally {
+            client.release();
+          }
+        },
         async close(): Promise<void> {
           if (pgPool) {
             await pgPool.end();
             pgPool = null;
           }
         },
-      }
-    : {
+      };
+
+const sqliteTxContext = new AsyncLocalStorage<{ depth: number }>();
+let sqliteTxMutex: Promise<void> = Promise.resolve();
+let sqliteSavepointSeq = 0;
+
+const sqliteClient: DbClient = {
         engine: 'sqlite',
         async get<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T | undefined> {
           const stmt = getSqlite().prepare(sql);
@@ -190,6 +347,56 @@ export const db: DbClient =
         async exec(sql: string): Promise<void> {
           getSqlite().exec(sql);
         },
+        async transaction<T>(fn: (tx: DbTx) => Promise<T>): Promise<T> {
+          const tx: DbTx = {
+            get: sqliteClient.get.bind(sqliteClient),
+            all: sqliteClient.all.bind(sqliteClient),
+            run: sqliteClient.run.bind(sqliteClient),
+            insert: sqliteClient.insert.bind(sqliteClient),
+          };
+
+          const existingCtx = sqliteTxContext.getStore();
+          if (existingCtx) {
+            const sqlite = getSqlite();
+            const spName = `inkloom_sp_${++sqliteSavepointSeq}`;
+            sqlite.exec(`SAVEPOINT ${spName}`);
+            try {
+              const result = await sqliteTxContext.run({ depth: existingCtx.depth + 1 }, () => fn(tx));
+              sqlite.exec(`RELEASE SAVEPOINT ${spName}`);
+              return result;
+            } catch (err) {
+              sqlite.exec(`ROLLBACK TO SAVEPOINT ${spName}`);
+              sqlite.exec(`RELEASE SAVEPOINT ${spName}`);
+              throw err;
+            }
+          }
+
+          let releaseMutex!: () => void;
+          const prevMutex = sqliteTxMutex;
+          sqliteTxMutex = new Promise<void>((resolve) => {
+            releaseMutex = resolve;
+          });
+          await prevMutex;
+
+          const sqlite = getSqlite();
+          try {
+            sqlite.exec('BEGIN IMMEDIATE');
+            try {
+              const result = await sqliteTxContext.run({ depth: 1 }, () => fn(tx));
+              sqlite.exec('COMMIT');
+              return result;
+            } catch (err) {
+              try {
+                sqlite.exec('ROLLBACK');
+              } catch {
+                // Ignore secondary rollback error
+              }
+              throw err;
+            }
+          } finally {
+            releaseMutex();
+          }
+        },
         async close(): Promise<void> {
           if (sqliteInstance) {
             sqliteInstance.close();
@@ -198,14 +405,102 @@ export const db: DbClient =
         },
       };
 
-async function applyPostgresMigrations(): Promise<void> {
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      filename TEXT PRIMARY KEY,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
+function getActiveClient(): DbClient {
+  return DB_ENGINE === 'postgres' ? pgClient : sqliteClient;
+}
 
+export const db: DbClient = {
+  get engine(): DbEngine {
+    return DB_ENGINE;
+  },
+  get<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T | undefined> {
+    return getActiveClient().get<T>(sql, ...params);
+  },
+  all<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T[]> {
+    return getActiveClient().all<T>(sql, ...params);
+  },
+  run(sql: string, ...params: unknown[]): Promise<RunResult> {
+    return getActiveClient().run(sql, ...params);
+  },
+  insert(sql: string, ...params: unknown[]): Promise<number> {
+    return getActiveClient().insert(sql, ...params);
+  },
+  exec(sql: string): Promise<void> {
+    return getActiveClient().exec(sql);
+  },
+  transaction<T>(fn: (tx: DbTx) => Promise<T>): Promise<T> {
+    return getActiveClient().transaction<T>(fn);
+  },
+  async close(): Promise<void> {
+    await pgClient.close();
+    await sqliteClient.close();
+  },
+};
+
+export function extractDevPostgresFallbackReason(err: unknown): string | null {
+  if (!err || typeof err !== 'object') return null;
+  const e = err as {
+    code?: unknown;
+    message?: unknown;
+    cause?: unknown;
+    errors?: unknown[];
+  };
+  const fallbackCodes = new Set([
+    // Network / socket errors
+    'ECONNREFUSED',
+    'ENETUNREACH',
+    'EHOSTUNREACH',
+    'ETIMEDOUT',
+    'ENOTFOUND',
+    'EAI_AGAIN',
+    'ECONNRESET',
+    // PostgreSQL connection & auth SQLSTATE codes
+    '08001',
+    '08003',
+    '08004',
+    '08006',
+    '28000',
+    '28P01',
+    '3D000',
+    'XX000',
+  ]);
+  if (typeof e.code === 'string' && fallbackCodes.has(e.code)) return e.code;
+  if (Array.isArray(e.errors)) {
+    for (const nested of e.errors) {
+      const reason = extractDevPostgresFallbackReason(nested);
+      if (reason) return reason;
+    }
+  }
+  if (e.cause) {
+    const reason = extractDevPostgresFallbackReason(e.cause);
+    if (reason) return reason;
+  }
+  if (typeof e.message === 'string') {
+    for (const code of fallbackCodes) {
+      if (e.message.includes(code)) return code;
+    }
+    if (/timeout expired|Connection terminated unexpectedly/i.test(e.message)) {
+      return 'ETIMEDOUT';
+    }
+    if (/password authentication failed/i.test(e.message)) {
+      return '28P01 (password authentication failed)';
+    }
+    if (/Tenant or user not found/i.test(e.message)) {
+      return 'XX000 (Tenant or user not found)';
+    }
+    if (/no pg_hba\.conf entry/i.test(e.message)) {
+      return '28000 (no pg_hba.conf entry)';
+    }
+    if (/database ".*" does not exist/i.test(e.message)) {
+      return '3D000 (database does not exist)';
+    }
+  }
+  return null;
+}
+
+const POSTGRES_MIGRATION_LOCK_ID = 84291047;
+
+async function applyPostgresMigrations(): Promise<void> {
   const migrationsDir = path.resolve(process.cwd(), 'supabase', 'migrations');
   if (!fs.existsSync(migrationsDir)) {
     throw new Error(`Missing PostgreSQL migrations directory at ${migrationsDir}`);
@@ -216,28 +511,42 @@ async function applyPostgresMigrations(): Promise<void> {
     .filter((f) => f.endsWith('.sql'))
     .sort();
 
-  for (const file of files) {
-    const existing = await db.get<{ filename: string }>(
-      'SELECT filename FROM schema_migrations WHERE filename = ?',
-      file
-    );
-    if (existing) continue;
+  const lockClient = await getPgPool().connect();
+  try {
+    // Serialize migrations across concurrent app instances/deployments
+    await lockClient.query('SELECT pg_advisory_lock($1)', [POSTGRES_MIGRATION_LOCK_ID]);
 
-    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf-8');
-    const client = await getPgPool().connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(sql);
-      await client.query('INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING', [
-        file,
-      ]);
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
+    await lockClient.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        filename TEXT PRIMARY KEY,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    for (const file of files) {
+      const existing = await lockClient.query(
+        'SELECT filename FROM schema_migrations WHERE filename = $1',
+        [file]
+      );
+      if ((existing.rowCount ?? 0) > 0) continue;
+
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf-8');
+      try {
+        await lockClient.query('BEGIN');
+        await lockClient.query(sql);
+        await lockClient.query(
+          'INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING',
+          [file]
+        );
+        await lockClient.query('COMMIT');
+      } catch (err) {
+        await lockClient.query('ROLLBACK').catch(() => {});
+        throw err;
+      }
     }
+  } finally {
+    await lockClient.query('SELECT pg_advisory_unlock($1)', [POSTGRES_MIGRATION_LOCK_ID]).catch(() => {});
+    lockClient.release();
   }
 }
 
@@ -255,8 +564,20 @@ async function applySqliteSchema(): Promise<void> {
       name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'reviewer',
+      role TEXT NOT NULL DEFAULT 'reviewer' CHECK (role IN ('reviewer', 'author')),
+      avatar_filename TEXT,
+      avatar_original_name TEXT,
+      job_title TEXT NOT NULL DEFAULT '',
+      bio TEXT NOT NULL DEFAULT '',
+      preferences_json TEXT NOT NULL DEFAULT '{}',
+      email_verified INTEGER NOT NULL DEFAULT 0,
+      email_verified_at TEXT,
+      verification_required INTEGER NOT NULL DEFAULT 0,
+      token_version INTEGER NOT NULL DEFAULT 1,
+      password_updated_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (id, company_id),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
     );
 
@@ -270,6 +591,7 @@ async function applySqliteSchema(): Promise<void> {
       logo_filename TEXT,
       logo_original_name TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (id, company_id),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
     );
 
@@ -281,10 +603,18 @@ async function applySqliteSchema(): Promise<void> {
       original_name TEXT NOT NULL,
       file_type TEXT NOT NULL,
       extracted_text TEXT NOT NULL,
-      uploaded_by INTEGER NOT NULL,
+      uploaded_by INTEGER,
+      content_hash TEXT,
+      extracted_rules_json TEXT,
+      extracted_at TEXT,
+      extraction_status TEXT NOT NULL DEFAULT 'pending',
+      extraction_error TEXT,
+      page_count INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (id, company_id),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-      FOREIGN KEY (brand_id) REFERENCES brands(id) ON DELETE CASCADE
+      FOREIGN KEY (brand_id, company_id) REFERENCES brands(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS approved_facts (
@@ -294,9 +624,14 @@ async function applySqliteSchema(): Promise<void> {
       fact_key TEXT NOT NULL,
       fact_value TEXT NOT NULL,
       source_doc TEXT NOT NULL DEFAULT 'Manual Entry',
+      source_document_id INTEGER,
+      source_page INTEGER,
+      source_section TEXT NOT NULL DEFAULT '',
+      source_excerpt TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-      FOREIGN KEY (brand_id) REFERENCES brands(id) ON DELETE CASCADE
+      FOREIGN KEY (brand_id, company_id) REFERENCES brands(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (source_document_id) REFERENCES guideline_documents(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS terminology_rules (
@@ -305,11 +640,16 @@ async function applySqliteSchema(): Promise<void> {
       brand_id INTEGER NOT NULL,
       prohibited_term TEXT NOT NULL,
       preferred_term TEXT NOT NULL,
-      severity TEXT NOT NULL DEFAULT 'high',
+      severity TEXT NOT NULL DEFAULT 'high' CHECK (severity IN ('critical', 'high', 'medium', 'low')),
       notes TEXT NOT NULL DEFAULT '',
+      source_document_id INTEGER,
+      source_page INTEGER,
+      source_section TEXT NOT NULL DEFAULT '',
+      source_excerpt TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-      FOREIGN KEY (brand_id) REFERENCES brands(id) ON DELETE CASCADE
+      FOREIGN KEY (brand_id, company_id) REFERENCES brands(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (source_document_id) REFERENCES guideline_documents(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS brand_rules (
@@ -318,9 +658,11 @@ async function applySqliteSchema(): Promise<void> {
       brand_id INTEGER NOT NULL UNIQUE,
       tone_rules TEXT NOT NULL DEFAULT '',
       messaging_rules TEXT NOT NULL DEFAULT '',
+      source_document_id INTEGER,
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-      FOREIGN KEY (brand_id) REFERENCES brands(id) ON DELETE CASCADE
+      FOREIGN KEY (brand_id, company_id) REFERENCES brands(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (source_document_id) REFERENCES guideline_documents(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS submissions (
@@ -336,14 +678,24 @@ async function applySqliteSchema(): Promise<void> {
       file_original_name TEXT,
       image_filename TEXT,
       image_alt_text TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'analyzed',
+      status TEXT NOT NULL DEFAULT 'analyzed' CHECK (status IN ('analyzed', 'pending_review', 'revision_saved', 'changes_requested', 'approved', 'rejected')),
+      compliance_score INTEGER CHECK (compliance_score IS NULL OR (compliance_score >= 0 AND compliance_score <= 100)),
+      analysis_coverage INTEGER CHECK (analysis_coverage IS NULL OR (analysis_coverage >= 0 AND analysis_coverage <= 100)),
+      ai_status TEXT NOT NULL DEFAULT 'completed' CHECK (ai_status IN ('completed', 'partial', 'failed', 'pending')),
+      ai_error TEXT,
+      request_idempotency_key TEXT,
+      content_hash TEXT,
+      analysis_stage TEXT NOT NULL DEFAULT 'completed',
+      analysis_timings_json TEXT,
+      reanalysis_started_at TEXT,
       checks_summary_json TEXT NOT NULL DEFAULT '[]',
       image_metrics_json TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (id, company_id),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-      FOREIGN KEY (brand_id) REFERENCES brands(id) ON DELETE CASCADE,
-      FOREIGN KEY (submitted_by) REFERENCES users(id) ON DELETE CASCADE
+      FOREIGN KEY (brand_id, company_id) REFERENCES brands(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (submitted_by, company_id) REFERENCES users(id, company_id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS compliance_issues (
@@ -351,40 +703,44 @@ async function applySqliteSchema(): Promise<void> {
       company_id INTEGER NOT NULL,
       submission_id INTEGER NOT NULL,
       category TEXT NOT NULL,
-      severity TEXT NOT NULL,
+      severity TEXT NOT NULL CHECK (severity IN ('critical', 'high', 'medium', 'low')),
       original_text TEXT NOT NULL,
       explanation TEXT NOT NULL,
       evidence TEXT NOT NULL,
       suggested_correction TEXT NOT NULL,
-      resolution_status TEXT NOT NULL DEFAULT 'open',
+      resolution_status TEXT NOT NULL DEFAULT 'open' CHECK (resolution_status IN ('open', 'accepted', 'rejected')),
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-      FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE
+      FOREIGN KEY (submission_id, company_id) REFERENCES submissions(id, company_id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS revisions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       company_id INTEGER NOT NULL,
       submission_id INTEGER NOT NULL,
-      edited_by INTEGER NOT NULL,
+      edited_by INTEGER,
       content TEXT NOT NULL,
       note TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-      FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE
+      FOREIGN KEY (submission_id, company_id) REFERENCES submissions(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (edited_by) REFERENCES users(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS review_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       company_id INTEGER NOT NULL,
       submission_id INTEGER NOT NULL,
-      reviewer_id INTEGER NOT NULL,
+      reviewer_id INTEGER,
       reviewer_name TEXT NOT NULL,
       decision TEXT NOT NULL,
+      previous_status TEXT NOT NULL DEFAULT '',
+      new_status TEXT NOT NULL DEFAULT '',
       comment TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-      FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE
+      FOREIGN KEY (submission_id, company_id) REFERENCES submissions(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (reviewer_id) REFERENCES users(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS revoked_tokens (
@@ -393,10 +749,36 @@ async function applySqliteSchema(): Promise<void> {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      company_id INTEGER NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      requested_ip TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id, company_id) REFERENCES users(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS email_verification_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      company_id INTEGER NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id, company_id) REFERENCES users(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS stored_files (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       company_id INTEGER NOT NULL,
       brand_id INTEGER NOT NULL,
+      user_id INTEGER,
       submission_id INTEGER,
       guideline_document_id INTEGER,
       asset_kind TEXT NOT NULL,
@@ -408,10 +790,17 @@ async function applySqliteSchema(): Promise<void> {
       size_bytes INTEGER NOT NULL DEFAULT 0,
       uploaded_by INTEGER,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      CHECK (
+        (asset_kind = 'brand_logo' AND brand_id IS NOT NULL AND submission_id IS NULL AND guideline_document_id IS NULL) OR
+        (asset_kind = 'guideline_document' AND brand_id IS NOT NULL AND guideline_document_id IS NOT NULL AND submission_id IS NULL) OR
+        (asset_kind IN ('submission_document', 'submission_image') AND brand_id IS NOT NULL AND submission_id IS NOT NULL AND guideline_document_id IS NULL)
+      ),
       FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-      FOREIGN KEY (brand_id) REFERENCES brands(id) ON DELETE CASCADE,
+      FOREIGN KEY (brand_id, company_id) REFERENCES brands(id, company_id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE,
-      FOREIGN KEY (guideline_document_id) REFERENCES guideline_documents(id) ON DELETE CASCADE
+      FOREIGN KEY (guideline_document_id) REFERENCES guideline_documents(id) ON DELETE CASCADE,
+      FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
@@ -426,22 +815,122 @@ async function applySqliteSchema(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_stored_files_company ON stored_files(company_id);
     CREATE INDEX IF NOT EXISTS idx_stored_files_filename ON stored_files(filename, company_id);
     CREATE INDEX IF NOT EXISTS idx_stored_files_brand ON stored_files(brand_id, company_id);
+    CREATE INDEX IF NOT EXISTS idx_submissions_company_status_created ON submissions(company_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_issues_company_category_severity ON compliance_issues(company_id, category, severity);
+    DROP INDEX IF EXISTS idx_password_reset_tokens_hash;
+    DROP INDEX IF EXISTS idx_email_verification_tokens_hash;
+    CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_expires ON password_reset_tokens(user_id, company_id, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_user_expires ON email_verification_tokens(user_id, company_id, expires_at);
   `);
+
+  const ensureSqliteColumn = async (table: string, column: string, definition: string) => {
+    const cols = await db.all<{ name: string }>(`PRAGMA table_info(${table})`);
+    if (!cols.some((c) => c.name === column)) {
+      await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  };
+
+  await ensureSqliteColumn('users', 'avatar_filename', 'TEXT');
+  await ensureSqliteColumn('users', 'avatar_original_name', 'TEXT');
+  await ensureSqliteColumn('users', 'job_title', "TEXT NOT NULL DEFAULT ''");
+  await ensureSqliteColumn('users', 'bio', "TEXT NOT NULL DEFAULT ''");
+  await ensureSqliteColumn('users', 'preferences_json', "TEXT NOT NULL DEFAULT '{}'");
+  await ensureSqliteColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureSqliteColumn('users', 'email_verified_at', 'TEXT');
+  await ensureSqliteColumn('users', 'verification_required', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureSqliteColumn('users', 'token_version', 'INTEGER NOT NULL DEFAULT 1');
+  await ensureSqliteColumn('users', 'password_updated_at', 'TEXT');
+  await ensureSqliteColumn('users', 'updated_at', "TEXT NOT NULL DEFAULT ''");
+  await db.run("UPDATE users SET updated_at = created_at WHERE updated_at = ''");
+
+  await ensureSqliteColumn('stored_files', 'user_id', 'INTEGER');
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_stored_files_user ON stored_files(user_id);');
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_stored_files_company_user ON stored_files(company_id, user_id);');
+  await db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_stored_files_company_filename_unique ON stored_files(company_id, filename);');
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_stored_files_submission ON stored_files(submission_id, company_id);');
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_stored_files_guideline_doc ON stored_files(guideline_document_id, company_id);');
+
+  await ensureSqliteColumn('guideline_documents', 'content_hash', 'TEXT');
+  await ensureSqliteColumn('guideline_documents', 'extracted_rules_json', 'TEXT');
+  await ensureSqliteColumn('guideline_documents', 'extracted_at', 'TEXT');
+  await ensureSqliteColumn('guideline_documents', 'extraction_status', "TEXT NOT NULL DEFAULT 'pending'");
+  await ensureSqliteColumn('guideline_documents', 'extraction_error', 'TEXT');
+  await ensureSqliteColumn('guideline_documents', 'page_count', 'INTEGER NOT NULL DEFAULT 1');
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_guideline_docs_hash ON guideline_documents(company_id, brand_id, content_hash);');
+
+  await ensureSqliteColumn('approved_facts', 'source_document_id', 'INTEGER');
+  await ensureSqliteColumn('approved_facts', 'source_page', 'INTEGER');
+  await ensureSqliteColumn('approved_facts', 'source_section', "TEXT NOT NULL DEFAULT ''");
+  await ensureSqliteColumn('approved_facts', 'source_excerpt', "TEXT NOT NULL DEFAULT ''");
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_facts_source_doc ON approved_facts(source_document_id);');
+
+  await ensureSqliteColumn('terminology_rules', 'source_document_id', 'INTEGER');
+  await ensureSqliteColumn('terminology_rules', 'source_page', 'INTEGER');
+  await ensureSqliteColumn('terminology_rules', 'source_section', "TEXT NOT NULL DEFAULT ''");
+  await ensureSqliteColumn('terminology_rules', 'source_excerpt', "TEXT NOT NULL DEFAULT ''");
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_terms_source_doc ON terminology_rules(source_document_id);');
+
+  await ensureSqliteColumn('brand_rules', 'source_document_id', 'INTEGER');
+
+  await ensureSqliteColumn('submissions', 'compliance_score', 'INTEGER');
+  await ensureSqliteColumn('submissions', 'analysis_coverage', 'INTEGER');
+  await ensureSqliteColumn('submissions', 'ai_status', "TEXT NOT NULL DEFAULT 'completed'");
+  await ensureSqliteColumn('submissions', 'ai_error', 'TEXT');
+  await ensureSqliteColumn('submissions', 'request_idempotency_key', 'TEXT');
+  await ensureSqliteColumn('submissions', 'content_hash', 'TEXT');
+  await ensureSqliteColumn('submissions', 'analysis_stage', "TEXT NOT NULL DEFAULT 'completed'");
+  await ensureSqliteColumn('submissions', 'analysis_timings_json', 'TEXT');
+  await ensureSqliteColumn('submissions', 'reanalysis_started_at', 'TEXT');
+  await db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_submissions_company_idempotency ON submissions(company_id, request_idempotency_key) WHERE request_idempotency_key IS NOT NULL;'
+  );
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_submissions_company_content_hash ON submissions(company_id, brand_id, content_hash);');
+
+  await ensureSqliteColumn('review_events', 'previous_status', "TEXT NOT NULL DEFAULT ''");
+  await ensureSqliteColumn('review_events', 'new_status', "TEXT NOT NULL DEFAULT ''");
+}
+
+export async function runMigrations(): Promise<void> {
+  if (DB_ENGINE === 'postgres') {
+    try {
+      await applyPostgresMigrations();
+      migrationsReady = true;
+      return;
+    } catch (err) {
+      const allowDevFallback =
+        !isProductionEnvironment() &&
+        process.env.INKLOOM_STRICT_POSTGRES !== 'true' &&
+        process.env.ALLOW_DEV_SQLITE_FALLBACK !== 'false';
+      const fallbackReason = extractDevPostgresFallbackReason(err);
+      if (allowDevFallback && fallbackReason) {
+        console.warn(
+          `[InkloomGuard AI] PostgreSQL is unavailable in development (${fallbackReason}). Falling back to local SQLite in DATA_DIR. Check DATABASE_URL if you want to use PostgreSQL locally.`
+        );
+        await pgClient.close().catch(() => {});
+        DB_ENGINE = 'sqlite';
+        await applySqliteSchema();
+        migrationsReady = true;
+        return;
+      }
+      migrationsReady = false;
+      throw err;
+    }
+  }
+  await applySqliteSchema();
+  migrationsReady = true;
 }
 
 export async function initDatabase(): Promise<void> {
   if (initialized) return;
 
-  if (DB_ENGINE === 'postgres') {
-    await applyPostgresMigrations();
-  } else {
-    await applySqliteSchema();
-  }
+  await runMigrations();
 
   const nowEpoch = Math.floor(Date.now() / 1000);
   await db.run('DELETE FROM revoked_tokens WHERE expires_at > 0 AND expires_at < ?', nowEpoch);
 
-  await seedInitialWorkspace();
+  if (!isProductionEnvironment()) {
+    await seedInitialWorkspace();
+  }
   initialized = true;
 }
 
@@ -456,16 +945,19 @@ export async function checkDatabaseHealth(): Promise<boolean> {
 
 export async function closeDatabase(): Promise<void> {
   initialized = false;
+  migrationsReady = false;
   await db.close();
 }
 
 async function seedInitialWorkspace(): Promise<void> {
+  if (isProductionEnvironment()) return;
+
   const existing = await db.get<{ cnt: number | string }>('SELECT CAST(COUNT(*) AS INTEGER) AS cnt FROM companies');
   if (Number(existing?.cnt ?? 0) > 0) return;
 
   const companyId = await db.insert('INSERT INTO companies (name) VALUES (?)', 'AetherFlow Systems');
 
-  const hash = bcrypt.hashSync('Inkloom2026!', 10);
+  const hash = await bcrypt.hash('Inkloom2026!', 10);
   const userId = await db.insert(
     'INSERT INTO users (company_id, name, email, password_hash, role) VALUES (?, ?, ?, ?, ?)',
     companyId,
@@ -520,8 +1012,9 @@ async function seedInitialWorkspace(): Promise<void> {
 
   const subId = await db.insert(
     `INSERT INTO submissions (
-      company_id, brand_id, submitted_by, title, input_type, original_content, revised_content, status, checks_summary_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      company_id, brand_id, submitted_by, title, input_type, original_content, revised_content,
+      status, compliance_score, ai_status, checks_summary_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     companyId,
     brandId,
     userId,
@@ -530,6 +1023,8 @@ async function seedInitialWorkspace(): Promise<void> {
     sampleOriginal,
     sampleOriginal,
     'pending_review',
+    38,
+    'completed',
     sampleChecks
   );
 

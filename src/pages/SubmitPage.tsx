@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { FileText, Image as ImageIcon, Send, UploadCloud, Loader2 } from 'lucide-react';
 import { api } from '../api';
 import type { Brand, PageKey } from '../types';
@@ -26,6 +26,11 @@ export function SubmitPage({
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const pendingIdempotencyKeyRef = useRef<string | null>(null);
+
+  function resetPendingIdempotencyKey() {
+    pendingIdempotencyKeyRef.current = null;
+  }
 
   async function loadBrands() {
     setLoading(true);
@@ -61,7 +66,16 @@ export function SubmitPage({
     }
   }, [selectedBrandId, brands]);
 
+  useEffect(() => {
+    return () => {
+      if (imagePreview) {
+        URL.revokeObjectURL(imagePreview);
+      }
+    };
+  }, [imagePreview]);
+
   function handleImageSelect(file: File | null) {
+    resetPendingIdempotencyKey();
     setImageFile(file);
     if (file) {
       const url = URL.createObjectURL(file);
@@ -73,6 +87,7 @@ export function SubmitPage({
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (submitting) return;
     setError('');
 
     if (!brandId || !brands.some((b) => b.id === brandId)) {
@@ -91,6 +106,12 @@ export function SubmitPage({
     setSubmitting(true);
 
     try {
+      if (!pendingIdempotencyKeyRef.current) {
+        pendingIdempotencyKeyRef.current =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `sub-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      }
       const fd = new FormData();
       fd.append('brandId', String(brandId));
       fd.append('title', title.trim());
@@ -99,11 +120,12 @@ export function SubmitPage({
       if (docFile) fd.append('document', docFile);
       if (imageFile) fd.append('image', imageFile);
 
-      const res = await api.createSubmission(fd);
+      const res = await api.createSubmission(fd, pendingIdempotencyKeyRef.current);
       const createdId = res?.submission?.id;
       if (typeof createdId !== 'number' || createdId <= 0) {
         throw new Error('Submission could not be opened because the server did not return a valid submission ID.');
       }
+      resetPendingIdempotencyKey();
       onSelectBrand(brandId);
       onSubmitted(createdId);
     } catch (err) {
@@ -164,6 +186,7 @@ export function SubmitPage({
                   key={b.id}
                   type="button"
                   onClick={() => {
+                    resetPendingIdempotencyKey();
                     setBrandId(b.id);
                     onSelectBrand(b.id);
                   }}
@@ -187,7 +210,10 @@ export function SubmitPage({
             type="text"
             required
             value={title}
-            onChange={(e) => setTitle(e.target.value)}
+            onChange={(e) => {
+              resetPendingIdempotencyKey();
+              setTitle(e.target.value);
+            }}
             placeholder="e.g. Q1 Product Release Announcement / LinkedIn Carousel Copy"
             className="clay-well w-full rounded-2xl px-4 py-3 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
           />
@@ -209,7 +235,10 @@ export function SubmitPage({
           <textarea
             rows={10}
             value={pastedText}
-            onChange={(e) => setPastedText(e.target.value)}
+            onChange={(e) => {
+              resetPendingIdempotencyKey();
+              setPastedText(e.target.value);
+            }}
             placeholder="Paste article draft, landing page copy, press release, or Markdown headings (# H1, ## H2)..."
             className="clay-well flex-1 w-full rounded-2xl p-4 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
           />
@@ -231,6 +260,7 @@ export function SubmitPage({
                   type="button"
                   onClick={(ev) => {
                     ev.preventDefault();
+                    resetPendingIdempotencyKey();
                     setDocFile(null);
                   }}
                   className="text-xs font-bold text-red-600 dark:text-rose-300 shrink-0 cursor-pointer"
@@ -241,7 +271,10 @@ export function SubmitPage({
               <input
                 type="file"
                 accept=".pdf,.docx,.txt,.md"
-                onChange={(e) => setDocFile(e.target.files?.[0] || null)}
+                onChange={(e) => {
+                  resetPendingIdempotencyKey();
+                  setDocFile(e.target.files?.[0] || null);
+                }}
                 className="hidden"
               />
             </label>
@@ -287,7 +320,10 @@ export function SubmitPage({
                 <input
                   type="text"
                   value={imageAltText}
-                  onChange={(e) => setImageAltText(e.target.value)}
+                  onChange={(e) => {
+                    resetPendingIdempotencyKey();
+                    setImageAltText(e.target.value);
+                  }}
                   placeholder="Image alt-text description (checked for accessibility)"
                   className="clay-well w-full rounded-2xl px-3.5 py-2.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
                 />

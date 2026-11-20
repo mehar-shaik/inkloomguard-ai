@@ -7,10 +7,13 @@ import {
   GitCompareArrows,
   CheckSquare,
   History,
+  Settings,
   LogOut,
   Search,
   Menu,
   X,
+  MailWarning,
+  Send,
 } from 'lucide-react';
 import {
   api,
@@ -21,7 +24,11 @@ import {
 } from './api';
 import type { AuthUser, PageKey, Submission } from './types';
 import { LoadingPanel, StatusBadge, ThemeToggle } from './components/ClayUI';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { AuthPage } from './pages/AuthPage';
+import { ForgotPasswordPage } from './pages/ForgotPasswordPage';
+import { ResetPasswordPage } from './pages/ResetPasswordPage';
+import { VerifyEmailPage } from './pages/VerifyEmailPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { GuidelinesPage } from './pages/GuidelinesPage';
 import { SubmitPage } from './pages/SubmitPage';
@@ -29,6 +36,7 @@ import { AnalysisPage } from './pages/AnalysisPage';
 import { CorrectionsPage } from './pages/CorrectionsPage';
 import { ReviewPage } from './pages/ReviewPage';
 import { HistoryPage } from './pages/HistoryPage';
+import { SettingsPage } from './pages/SettingsPage';
 import shieldEmblem from '/src/assets/images/inkloom_shield_emblem_1794725371250.jpg';
 import userAvatar from '/src/assets/images/avatar_compliance_lead_1794725371926.jpg';
 
@@ -40,16 +48,76 @@ const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: React.ComponentType<
   { key: 'corrections', label: 'Correction Suggestions', icon: GitCompareArrows },
   { key: 'review', label: 'Review & Approval', icon: CheckSquare },
   { key: 'history', label: 'Review History', icon: History },
+  { key: 'settings', label: 'Settings', icon: Settings },
 ];
 
+const VALID_PAGES = new Set<PageKey>(NAV_ITEMS.map((item) => item.key));
+
+type PublicAuthView =
+  | { view: 'auth' }
+  | { view: 'forgot-password' }
+  | { view: 'reset-password'; token: string }
+  | { view: 'verify-email'; token: string };
+
+function parseInitialPublicAuthView(): PublicAuthView {
+  if (typeof window === 'undefined') return { view: 'auth' };
+  const params = new URLSearchParams(window.location.search);
+  const mode = params.get('mode');
+  const token = params.get('token') || '';
+  if (mode === 'forgot-password') return { view: 'forgot-password' };
+  if (mode === 'reset-password') return { view: 'reset-password', token };
+  if (mode === 'verify-email') return { view: 'verify-email', token };
+  return { view: 'auth' };
+}
+
+function clearAuthQueryParams(): void {
+  if (typeof window === 'undefined') return;
+  if (window.location.search) {
+    const cleanUrl = `${window.location.pathname}${window.location.hash || ''}`;
+    window.history.replaceState(null, '', cleanUrl);
+  }
+}
+
+function parseHashState(): { page: PageKey; brandId: number | null; submissionId: number | null } {
+  if (typeof window === 'undefined') {
+    return { page: 'dashboard', brandId: null, submissionId: null };
+  }
+  const raw = window.location.hash.replace(/^#/, '');
+  const params = new URLSearchParams(raw);
+  const pageParam = params.get('page') as PageKey | null;
+  const page: PageKey = pageParam && VALID_PAGES.has(pageParam) ? pageParam : 'dashboard';
+  const bId = Number(params.get('brandId'));
+  const sId = Number(params.get('submissionId'));
+  return {
+    page,
+    brandId: Number.isInteger(bId) && bId > 0 ? bId : null,
+    submissionId: Number.isInteger(sId) && sId > 0 ? sId : null,
+  };
+}
+
+function buildHashString(page: PageKey, brandId: number | null, submissionId: number | null): string {
+  const params = new URLSearchParams();
+  params.set('page', page);
+  if (brandId && brandId > 0) params.set('brandId', String(brandId));
+  if (submissionId && submissionId > 0) params.set('submissionId', String(submissionId));
+  return `#${params.toString()}`;
+}
+
 export default function App() {
+  const initialHash = parseHashState();
   const [user, setUser] = useState<AuthUser | null>(null);
   const [checkingSession, setCheckingSession] = useState(true);
   const [sessionNotice, setSessionNotice] = useState('');
-  const [activePage, setActivePage] = useState<PageKey>('dashboard');
-  const [selectedBrandId, setSelectedBrandId] = useState<number | null>(null);
-  const [selectedSubmissionId, setSelectedSubmissionId] = useState<number | null>(null);
+  const [authView, setAuthView] = useState<PublicAuthView>(() => parseInitialPublicAuthView());
+  const [activePage, setActivePage] = useState<PageKey>(initialHash.page);
+  const [selectedBrandId, setSelectedBrandId] = useState<number | null>(initialHash.brandId);
+  const [selectedSubmissionId, setSelectedSubmissionId] = useState<number | null>(initialHash.submissionId);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
+  const [verifyBannerDismissed, setVerifyBannerDismissed] = useState(false);
+  const [verifyBannerLoading, setVerifyBannerLoading] = useState(false);
+  const [verifyBannerMessage, setVerifyBannerMessage] = useState('');
+  const [verifyBannerError, setVerifyBannerError] = useState('');
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try {
@@ -76,10 +144,34 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
+    function syncFromHash() {
+      const next = parseHashState();
+      setActivePage(next.page);
+      if (next.brandId !== null) setSelectedBrandId(next.brandId);
+      if (next.submissionId !== null) setSelectedSubmissionId(next.submissionId);
+    }
+    window.addEventListener('hashchange', syncFromHash);
+    window.addEventListener('popstate', syncFromHash);
+    return () => {
+      window.removeEventListener('hashchange', syncFromHash);
+      window.removeEventListener('popstate', syncFromHash);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!user || authView.view !== 'auth') return;
+    const nextHash = buildHashString(activePage, selectedBrandId, selectedSubmissionId);
+    if (window.location.hash !== nextHash) {
+      window.history.replaceState(null, '', nextHash);
+    }
+  }, [user, authView.view, activePage, selectedBrandId, selectedSubmissionId]);
+
+  useEffect(() => {
     setUnauthorizedHandler((msg) => {
       setUser(null);
       setSelectedBrandId(null);
       setSelectedSubmissionId(null);
+      setAuthView({ view: 'auth' });
       setSessionNotice(msg || 'Your session expired. Please sign in again.');
     });
     return () => setUnauthorizedHandler(null);
@@ -130,14 +222,32 @@ export default function App() {
     }
   }
 
-  async function handleAuthSuccess(token: string) {
+  async function handleAuthSuccess(
+    token: string,
+    meta?: { verificationEmailSent?: boolean; verificationEmailError?: string }
+  ) {
     setAuthToken(token);
     setCheckingSession(true);
     try {
       const verified = await api.me();
       setUser(verified.user);
       setSessionNotice('');
+      setAuthView({ view: 'auth' });
+      clearAuthQueryParams();
       setActivePage('dashboard');
+      setVerifyBannerDismissed(false);
+      if (meta?.verificationEmailSent) {
+        setVerifyBannerMessage(
+          `Verification link sent to ${verified.user.email}. Please check your inbox to verify your account.`
+        );
+        setVerifyBannerError('');
+      } else if (meta?.verificationEmailError) {
+        setVerifyBannerMessage('');
+        setVerifyBannerError(meta.verificationEmailError);
+      } else {
+        setVerifyBannerMessage('');
+        setVerifyBannerError('');
+      }
     } catch (err) {
       clearAuthToken();
       setUser(null);
@@ -156,6 +266,32 @@ export default function App() {
     setSelectedBrandId(null);
     setSelectedSubmissionId(null);
     setActivePage('dashboard');
+    setAuthView({ view: 'auth' });
+    clearAuthQueryParams();
+  }
+
+  function handleSignedOutAll() {
+    clearAuthToken();
+    setUser(null);
+    setSelectedBrandId(null);
+    setSelectedSubmissionId(null);
+    setActivePage('dashboard');
+    setAuthView({ view: 'auth' });
+    setSessionNotice('All active sessions were signed out. Please sign in again.');
+  }
+
+  async function handleBannerResendVerification() {
+    setVerifyBannerLoading(true);
+    setVerifyBannerMessage('');
+    setVerifyBannerError('');
+    try {
+      const res = await api.resendVerification();
+      setVerifyBannerMessage(res.message);
+    } catch (err) {
+      setVerifyBannerError(err instanceof Error ? err.message : 'Unable to send verification email.');
+    } finally {
+      setVerifyBannerLoading(false);
+    }
   }
 
   function handleSelectSubmission(submissionId: number, page: PageKey) {
@@ -164,24 +300,89 @@ export default function App() {
     setMobileNavOpen(false);
   }
 
+  const toggleTheme = () => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
+
   if (checkingSession) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-6">
-        <div className="max-w-md w-full">
-          <LoadingPanel label="Verifying InkloomGuard AI session..." />
+      <ErrorBoundary>
+        <div className="min-h-screen flex items-center justify-center p-6">
+          <div className="max-w-md w-full">
+            <LoadingPanel label="Verifying InkloomGuard AI session..." />
+          </div>
         </div>
-      </div>
+      </ErrorBoundary>
+    );
+  }
+
+  if (authView.view === 'verify-email') {
+    return (
+      <ErrorBoundary>
+        <VerifyEmailPage
+          token={authView.token}
+          isAuthenticated={Boolean(user)}
+          userEmail={user?.email}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          onVerifiedRefresh={async () => {
+            const res = await api.me();
+            setUser(res.user);
+          }}
+          onBackToApp={() => {
+            clearAuthQueryParams();
+            setAuthView({ view: 'auth' });
+          }}
+        />
+      </ErrorBoundary>
     );
   }
 
   if (!user) {
+    if (authView.view === 'forgot-password') {
+      return (
+        <ErrorBoundary>
+          <ForgotPasswordPage
+            theme={theme}
+            onToggleTheme={toggleTheme}
+            onBackToLogin={() => {
+              clearAuthQueryParams();
+              setAuthView({ view: 'auth' });
+            }}
+          />
+        </ErrorBoundary>
+      );
+    }
+
+    if (authView.view === 'reset-password') {
+      return (
+        <ErrorBoundary>
+          <ResetPasswordPage
+            token={authView.token}
+            theme={theme}
+            onToggleTheme={toggleTheme}
+            onGoForgotPassword={() => {
+              clearAuthQueryParams();
+              setAuthView({ view: 'forgot-password' });
+            }}
+            onBackToLogin={() => {
+              clearAuthQueryParams();
+              setAuthView({ view: 'auth' });
+            }}
+          />
+        </ErrorBoundary>
+      );
+    }
+
     return (
-      <AuthPage
-        onAuthSuccess={handleAuthSuccess}
-        theme={theme}
-        onToggleTheme={() => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'))}
-        sessionNotice={sessionNotice}
-      />
+      <ErrorBoundary>
+        <AuthPage
+          onAuthSuccess={handleAuthSuccess}
+          onForgotPassword={() => setAuthView({ view: 'forgot-password' })}
+          onResendVerification={() => setAuthView({ view: 'verify-email', token: '' })}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          sessionNotice={sessionNotice}
+        />
+      </ErrorBoundary>
     );
   }
 
@@ -194,7 +395,13 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen flex p-3 sm:p-5 lg:p-6 gap-5 lg:gap-6 relative">
+    <ErrorBoundary
+      onReset={() => {
+        setActivePage('dashboard');
+        setSelectedSubmissionId(null);
+      }}
+    >
+      <div className="min-h-screen flex p-3 sm:p-5 lg:p-6 gap-5 lg:gap-6 relative">
       {/* Subtle Background Ambient Spheres */}
       <div
         aria-hidden="true"
@@ -219,7 +426,7 @@ export default function App() {
           mobileNavOpen ? 'translate-x-0' : '-translate-x-[120%] lg:translate-x-0'
         }`}
       >
-        <div className="space-y-7">
+        <div className="space-y-6 overflow-y-auto pr-0.5">
           <div className="flex items-center justify-between gap-3 px-1">
             <div className="flex items-center gap-3 min-w-0">
               <img
@@ -254,7 +461,7 @@ export default function App() {
                     setActivePage(item.key);
                     setMobileNavOpen(false);
                   }}
-                  className={`w-full flex items-center gap-3 px-4 py-3 rounded-full text-sm font-semibold transition-all cursor-pointer whitespace-nowrap ${
+                  className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-sm font-semibold transition-all cursor-pointer whitespace-nowrap ${
                     isActive
                       ? 'clay-btn-primary'
                       : 'text-slate-600 dark:text-slate-300 hover:bg-indigo-50/70 dark:hover:bg-violet-900/30 hover:text-slate-900 dark:hover:text-white'
@@ -324,12 +531,14 @@ export default function App() {
               </kbd>
             </button>
 
-            <ThemeToggle
-              theme={theme}
-              onToggle={() => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'))}
-            />
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
 
-            <div className="flex items-center gap-2.5 pl-1">
+            <button
+              type="button"
+              onClick={() => setActivePage('settings')}
+              title="Account & Security Settings"
+              className="flex items-center gap-2.5 pl-1 cursor-pointer text-left rounded-full pr-2 py-0.5 hover:bg-indigo-50/60 dark:hover:bg-violet-900/30 transition-colors"
+            >
               <img
                 src={userAvatar}
                 alt={user.name}
@@ -340,9 +549,63 @@ export default function App() {
                 <p className="text-xs font-bold text-slate-900 dark:text-white">{user.name}</p>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400 capitalize">{user.role}</p>
               </div>
-            </div>
+            </button>
           </div>
         </header>
+
+        {/* Unverified Email Notice Banner */}
+        {!user.emailVerified && !verifyBannerDismissed && activePage !== 'settings' && (
+          <div
+            role="status"
+            className="clay-surface rounded-[24px] px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border border-amber-200/90 dark:border-amber-400/30"
+          >
+            <div className="flex items-start sm:items-center gap-3 min-w-0">
+              <div className="w-8 h-8 rounded-full bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 flex items-center justify-center shrink-0">
+                <MailWarning className="w-4 h-4" />
+              </div>
+              <div className="text-xs space-y-0.5 min-w-0">
+                <p className="font-bold text-slate-900 dark:text-white">
+                  Verify your email address ({user.email})
+                </p>
+                {verifyBannerMessage ? (
+                  <p className="text-emerald-700 dark:text-emerald-300 font-semibold">{verifyBannerMessage}</p>
+                ) : verifyBannerError ? (
+                  <p className="text-red-700 dark:text-rose-300 font-semibold">{verifyBannerError}</p>
+                ) : (
+                  <p className="text-slate-600 dark:text-slate-300">
+                    Confirm your email to protect password recovery and account security alerts.
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleBannerResendVerification}
+                disabled={verifyBannerLoading}
+                className="clay-btn-primary rounded-full px-4 py-2 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+              >
+                <Send className="w-3.5 h-3.5" />
+                {verifyBannerLoading ? 'Sending...' : 'Resend Link'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setActivePage('settings')}
+                className="clay-btn-secondary rounded-full px-3.5 py-2 text-xs font-semibold cursor-pointer"
+              >
+                Security Settings
+              </button>
+              <button
+                type="button"
+                onClick={() => setVerifyBannerDismissed(true)}
+                aria-label="Dismiss verification notice"
+                className="p-1.5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Active Page Viewport */}
         <main className="flex-1 pb-6">
@@ -356,6 +619,7 @@ export default function App() {
           )}
           {activePage === 'guidelines' && (
             <GuidelinesPage
+              userRole={user.role}
               selectedBrandId={selectedBrandId}
               onSelectBrand={(id) => setSelectedBrandId(id)}
               onNavigate={setActivePage}
@@ -395,6 +659,15 @@ export default function App() {
             <HistoryPage
               onSelectSubmission={handleSelectSubmission}
               onNavigate={setActivePage}
+            />
+          )}
+          {activePage === 'settings' && (
+            <SettingsPage
+              user={user}
+              theme={theme}
+              onToggleTheme={toggleTheme}
+              onUserUpdated={(updated) => setUser(updated)}
+              onSignedOutAll={handleSignedOutAll}
             />
           )}
         </main>
@@ -447,6 +720,7 @@ export default function App() {
           </div>
         </div>
       )}
-    </div>
+      </div>
+    </ErrorBoundary>
   );
 }

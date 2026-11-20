@@ -10,6 +10,10 @@ import type {
   ComplianceIssue,
   Revision,
   ReviewEvent,
+  ExtractedGuidelinesPayload,
+  ExtractedFactProposal,
+  ExtractedTerminologyProposal,
+  GuidelineConflict,
 } from './types';
 
 const TOKEN_STORAGE_KEY = 'inkloom_auth_token';
@@ -41,7 +45,17 @@ export function setAuthToken(token: string): void {
   }
 }
 
+const MAX_BLOB_CACHE_ENTRIES = 60;
+const protectedBlobCache = new Map<string, Blob>();
+const protectedBlobInFlight = new Map<string, Promise<Blob>>();
+
+export function clearProtectedAssetCache(): void {
+  protectedBlobCache.clear();
+  protectedBlobInFlight.clear();
+}
+
 export function clearAuthToken(): void {
+  clearProtectedAssetCache();
   try {
     localStorage.removeItem(TOKEN_STORAGE_KEY);
   } catch {
@@ -57,6 +71,8 @@ export function clearAuthToken(): void {
 export interface AuthResponse {
   user: AuthUser;
   token: string;
+  verificationEmailSent?: boolean;
+  verificationEmailError?: string;
 }
 
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -64,7 +80,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const token = getAuthToken();
 
   const headers: Record<string, string> = isFormData
-    ? {}
+    ? { ...(options.headers as Record<string, string> | undefined) }
     : { 'Content-Type': 'application/json', ...(options.headers as Record<string, string> | undefined) };
 
   if (token) {
@@ -109,15 +125,42 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
 
 export async function fetchProtectedAssetBlobUrl(filename: string): Promise<string> {
   const token = getAuthToken();
-  const headers: Record<string, string> = {};
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
+  const cacheKey = `${token || 'anon'}::${filename}`;
+
+  const cachedBlob = protectedBlobCache.get(cacheKey);
+  if (cachedBlob) {
+    protectedBlobCache.delete(cacheKey);
+    protectedBlobCache.set(cacheKey, cachedBlob);
+    return URL.createObjectURL(cachedBlob);
   }
-  const res = await fetch(`/api/uploads/${encodeURIComponent(filename)}`, { headers });
-  if (!res.ok) {
-    throw new Error(`Unable to load asset (${res.status})`);
+
+  let promise = protectedBlobInFlight.get(cacheKey);
+  if (!promise) {
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    promise = fetch(`/api/uploads/${encodeURIComponent(filename)}`, { headers })
+      .then(async (res) => {
+        if (!res.ok) {
+          throw new Error(`Unable to load asset (${res.status})`);
+        }
+        return res.blob();
+      })
+      .finally(() => {
+        protectedBlobInFlight.delete(cacheKey);
+      });
+    protectedBlobInFlight.set(cacheKey, promise);
   }
-  const blob = await res.blob();
+
+  const blob = await promise;
+  if (protectedBlobCache.size >= MAX_BLOB_CACHE_ENTRIES) {
+    const oldestKey = protectedBlobCache.keys().next().value;
+    if (oldestKey) {
+      protectedBlobCache.delete(oldestKey);
+    }
+  }
+  protectedBlobCache.set(cacheKey, blob);
   return URL.createObjectURL(blob);
 }
 
@@ -142,6 +185,49 @@ export const api = {
     }),
   demoLogin: () => request<AuthResponse>('/api/auth/demo', { method: 'POST' }),
   logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+  logoutAll: () => request<{ ok: boolean; message: string }>('/api/auth/logout-all', { method: 'POST' }),
+  forgotPassword: (email: string) =>
+    request<{ ok: boolean; message: string }>('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+  validateResetToken: (token: string) =>
+    request<{ valid: boolean; reason?: string; error?: string }>(
+      `/api/auth/reset-password/validate?token=${encodeURIComponent(token)}`
+    ),
+  resetPassword: (payload: { token: string; newPassword: string; confirmPassword: string }) =>
+    request<{ ok: boolean; message: string }>('/api/auth/reset-password', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  verifyEmail: (token: string) =>
+    request<{ ok: boolean; user?: AuthUser; message?: string; reason?: string; error?: string }>(
+      '/api/auth/verify-email',
+      {
+        method: 'POST',
+        body: JSON.stringify({ token }),
+      }
+    ),
+  resendVerification: (email?: string) =>
+    request<{ ok: boolean; message: string }>('/api/auth/resend-verification', {
+      method: 'POST',
+      body: JSON.stringify(email ? { email } : {}),
+    }),
+  changePassword: (payload: {
+    currentPassword: string;
+    newPassword: string;
+    confirmPassword: string;
+  }) =>
+    request<{
+      ok: boolean;
+      user: AuthUser;
+      token: string;
+      confirmationEmailSent: boolean;
+      message: string;
+    }>('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   // Dashboard
   getDashboard: () => request<DashboardData>('/api/dashboard'),
@@ -172,22 +258,49 @@ export const api = {
   uploadGuidelineDoc: (brandId: number, formData: FormData) =>
     request<{
       document: GuidelineDocument;
-      autoExtracted: {
-        toneRules: string;
-        messagingRules: string;
-        facts: Array<{ fact_key: string; fact_value: string }>;
-        terminology: Array<{ prohibited_term: string; preferred_term: string; severity: string; notes: string }>;
-      } | null;
+      autoExtracted: ExtractedGuidelinesPayload | null;
+      extractionStatus?: string;
+      extractionError?: string | null;
+      conflicts?: GuidelineConflict[];
     }>(`/api/guidelines/${brandId}/upload`, { method: 'POST', body: formData }),
-  aiExtractDoc: (brandId: number, docId: number) =>
+  aiExtractDoc: (brandId: number, docId: number, force = false) =>
     request<{
-      extracted: {
-        toneRules: string;
-        messagingRules: string;
-        facts: Array<{ fact_key: string; fact_value: string }>;
-        terminology: Array<{ prohibited_term: string; preferred_term: string; severity: string; notes: string }>;
+      extracted: ExtractedGuidelinesPayload;
+      cached?: boolean;
+      conflicts?: GuidelineConflict[];
+    }>(`/api/guidelines/${brandId}/ai-extract/${docId}`, {
+      method: 'POST',
+      body: JSON.stringify({ force }),
+    }),
+  deleteGuidelineDoc: (brandId: number, docId: number) =>
+    request<{ ok: boolean }>(`/api/guidelines/${brandId}/documents/${docId}`, { method: 'DELETE' }),
+  applyExtractedGuidelines: (
+    brandId: number,
+    payload: {
+      sourceDocId: number;
+      sourceDoc?: string;
+      toneRules?: string;
+      messagingRules?: string;
+      facts: ExtractedFactProposal[];
+      terminology: ExtractedTerminologyProposal[];
+    }
+  ) =>
+    request<{
+      rules: BrandRules;
+      facts: ApprovedFact[];
+      terminology: TerminologyRule[];
+      conflicts?: GuidelineConflict[];
+      summary: {
+        rulesUpdated: boolean;
+        factsAdded: number;
+        factsSkipped: number;
+        terminologyAdded: number;
+        terminologySkipped: number;
       };
-    }>(`/api/guidelines/${brandId}/ai-extract/${docId}`, { method: 'POST' }),
+    }>(`/api/guidelines/${brandId}/apply-extracted`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   saveBrandRules: (brandId: number, tone_rules: string, messaging_rules: string) =>
     request<{ rules: BrandRules }>(`/api/guidelines/${brandId}/rules`, {
       method: 'PUT',
@@ -236,12 +349,18 @@ export const api = {
       reviewEvents: Array.isArray(res.reviewEvents) ? res.reviewEvents : [],
     };
   },
-  createSubmission: async (formData: FormData) => {
+  createSubmission: async (formData: FormData, idempotencyKey?: string) => {
+    const key =
+      idempotencyKey ||
+      (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : undefined);
     const res = await request<{ submission?: Submission; issues?: ComplianceIssue[]; aiError?: string }>(
       '/api/submissions',
       {
         method: 'POST',
         body: formData,
+        headers: key ? { 'Idempotency-Key': key } : undefined,
       }
     );
     if (!res || !res.submission || typeof res.submission.id !== 'number') {
@@ -250,6 +369,23 @@ export const api = {
     return {
       submission: res.submission,
       issues: Array.isArray(res.issues) ? res.issues : [],
+      aiError: res.aiError,
+    };
+  },
+  reanalyzeSubmission: async (submissionId: number) => {
+    const res = await request<{
+      submission?: Submission;
+      issues?: ComplianceIssue[];
+      reviewEvents?: ReviewEvent[];
+      aiError?: string;
+    }>(`/api/submissions/${submissionId}/reanalyze`, { method: 'POST' });
+    if (!res || !res.submission || typeof res.submission.id !== 'number') {
+      throw new Error('Re-analysis response was missing a valid submission record.');
+    }
+    return {
+      submission: res.submission,
+      issues: Array.isArray(res.issues) ? res.issues : [],
+      reviewEvents: Array.isArray(res.reviewEvents) ? res.reviewEvents : [],
       aiError: res.aiError,
     };
   },

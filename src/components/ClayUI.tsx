@@ -14,27 +14,37 @@ import type { Brand } from '../types';
 
 export function StatusBadge({ status }: { status: string }) {
   const normalized = status.toLowerCase();
-  if (normalized === 'approved' || normalized === 'passed') {
+  if (normalized === 'approved' || normalized === 'passed' || normalized === 'completed') {
+    const label =
+      normalized === 'passed' ? 'Passed' : normalized === 'completed' ? 'Completed' : 'Approved';
     return (
       <span className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold whitespace-nowrap shrink-0 bg-emerald-50 text-emerald-800 border border-emerald-200/80 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border-emerald-400/35">
         <CheckCircle2 className="w-3.5 h-3.5" />
-        {normalized === 'passed' ? 'Passed' : 'Approved'}
+        {label}
       </span>
     );
   }
-  if (normalized === 'rejected' || normalized === 'issues_found') {
+  if (normalized === 'rejected' || normalized === 'issues_found' || normalized === 'failed') {
+    const label =
+      normalized === 'issues_found' ? 'Issues Found' : normalized === 'failed' ? 'Failed' : 'Rejected';
     return (
       <span className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold whitespace-nowrap shrink-0 bg-red-50 text-red-800 border border-red-200/80 dark:bg-rose-500/15 dark:text-rose-300 dark:border-rose-400/35">
         <XCircle className="w-3.5 h-3.5" />
-        {normalized === 'issues_found' ? 'Issues Found' : 'Rejected'}
+        {label}
       </span>
     );
   }
-  if (normalized === 'changes_requested' || normalized === 'warning') {
+  if (normalized === 'changes_requested' || normalized === 'warning' || normalized === 'partial') {
+    const label =
+      normalized === 'warning'
+        ? 'Attention'
+        : normalized === 'partial'
+          ? 'Partial AI'
+          : 'Changes Requested';
     return (
       <span className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold whitespace-nowrap shrink-0 bg-amber-50 text-amber-800 border border-amber-200/80 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-400/35">
         <AlertTriangle className="w-3.5 h-3.5" />
-        {normalized === 'warning' ? 'Attention' : 'Changes Requested'}
+        {label}
       </span>
     );
   }
@@ -46,10 +56,18 @@ export function StatusBadge({ status }: { status: string }) {
       </span>
     );
   }
+  const defaultLabel =
+    normalized === 'analyzed'
+      ? 'Analyzed'
+      : normalized === 'reanalyzed'
+        ? 'Re-analyzed'
+        : normalized === 'pending'
+          ? 'Running'
+          : 'Pending Review';
   return (
     <span className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold whitespace-nowrap shrink-0 bg-indigo-50 text-indigo-800 border border-indigo-200/80 dark:bg-sky-500/15 dark:text-sky-300 dark:border-sky-400/35">
       <Clock className="w-3.5 h-3.5" />
-      {normalized === 'analyzed' ? 'Analyzed' : 'Pending Review'}
+      {defaultLabel}
     </span>
   );
 }

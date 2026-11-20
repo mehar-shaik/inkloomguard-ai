@@ -1,11 +1,15 @@
-import fs from 'node:fs';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { UPLOAD_DIR } from './db.ts';
+import { UPLOAD_DIR, isProductionEnvironment } from './db.ts';
 
 export type StorageBackend = 'supabase' | 'local';
-export type AssetKind = 'brand_logo' | 'guideline_document' | 'submission_document' | 'submission_image';
+export type AssetKind =
+  | 'brand_logo'
+  | 'guideline_document'
+  | 'submission_document'
+  | 'submission_image';
 
 export interface StoredObjectResult {
   backend: StorageBackend;
@@ -48,8 +52,7 @@ function getSupabaseClient(): SupabaseClient {
 export function getStorageMode(): StorageBackend {
   if (hasSupabaseConfig) return 'supabase';
 
-  const isProductionRuntime = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
-  if (isProductionRuntime && process.env.ALLOW_LOCAL_STORAGE_FALLBACK !== 'true') {
+  if (isProductionEnvironment()) {
     throw new Error(
       'Supabase Storage (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_STORAGE_BUCKET=inkloomguard-files) must be configured in production. Local filesystem storage is disabled in production.'
     );
@@ -57,11 +60,11 @@ export function getStorageMode(): StorageBackend {
   return 'local';
 }
 
-export function getStorageStatus(): { mode: StorageBackend; bucket: string | null } {
+export function getStorageStatus(): { mode: StorageBackend; bucket: string | null; configured: boolean } {
   if (hasSupabaseConfig && supabaseBucket) {
-    return { mode: 'supabase', bucket: supabaseBucket };
+    return { mode: 'supabase', bucket: supabaseBucket, configured: true };
   }
-  return { mode: 'local', bucket: null };
+  return { mode: 'local', bucket: null, configured: !isProductionEnvironment() };
 }
 
 export function generateSafeStorageFilename(originalName: string): string {
@@ -90,9 +93,20 @@ export function inferMimeType(filename: string, fallbackMime?: string): string {
   return fallbackMime || 'application/octet-stream';
 }
 
-function buildTenantStorageKey(companyId: number, brandId: number, assetKind: AssetKind, filename: string): string {
-  const safeName = sanitizeLookupFilename(filename);
-  return `companies/${companyId}/brands/${brandId}/${assetKind}/${safeName}`;
+function buildTenantStorageKey(params: {
+  companyId: number;
+  brandId?: number | null;
+  assetKind: AssetKind;
+  filename: string;
+}): string {
+  if (!Number.isInteger(params.companyId) || params.companyId <= 0) {
+    throw new Error('Valid organization companyId is required for file storage.');
+  }
+  const safeName = sanitizeLookupFilename(params.filename);
+  if (!params.brandId || !Number.isInteger(params.brandId) || params.brandId <= 0) {
+    throw new Error('Valid brandId is required for brand asset storage.');
+  }
+  return `companies/${params.companyId}/brands/${params.brandId}/${params.assetKind}/${safeName}`;
 }
 
 function resolveLocalFilePath(storageKeyOrFilename: string): string {
@@ -102,6 +116,15 @@ function resolveLocalFilePath(storageKeyOrFilename: string): string {
     throw new Error('Path traversal rejected.');
   }
   return candidate;
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function uploadAsset(params: {
@@ -115,7 +138,12 @@ export async function uploadAsset(params: {
   const mode = getStorageMode();
   const filename = generateSafeStorageFilename(params.originalName);
   const mimeType = inferMimeType(filename, params.mimeType);
-  const storageKey = buildTenantStorageKey(params.companyId, params.brandId, params.assetKind, filename);
+  const storageKey = buildTenantStorageKey({
+    companyId: params.companyId,
+    brandId: params.brandId,
+    assetKind: params.assetKind,
+    filename,
+  });
 
   if (mode === 'supabase') {
     const client = getSupabaseClient();
@@ -137,8 +165,8 @@ export async function uploadAsset(params: {
 
   // Local development fallback (DATA_DIR/uploads)
   const localPath = resolveLocalFilePath(storageKey);
-  fs.mkdirSync(path.dirname(localPath), { recursive: true });
-  fs.writeFileSync(localPath, params.buffer);
+  await fs.mkdir(path.dirname(localPath), { recursive: true });
+  await fs.writeFile(localPath, params.buffer);
 
   return {
     backend: 'local',
@@ -166,12 +194,12 @@ export async function downloadAsset(params: {
 
   // Check tenant storageKey first, then legacy flat UPLOAD_DIR/<filename>
   const safeKeyPath = resolveLocalFilePath(params.storageKey);
-  if (fs.existsSync(safeKeyPath)) {
-    return fs.readFileSync(safeKeyPath);
+  if (await fileExists(safeKeyPath)) {
+    return fs.readFile(safeKeyPath);
   }
   const legacyFlatPath = resolveLocalFilePath(sanitizeLookupFilename(params.filename));
-  if (fs.existsSync(legacyFlatPath)) {
-    return fs.readFileSync(legacyFlatPath);
+  if (await fileExists(legacyFlatPath)) {
+    return fs.readFile(legacyFlatPath);
   }
   throw new Error('File not found in local storage.');
 }
@@ -200,17 +228,20 @@ export async function deleteAsset(params: {
 }): Promise<void> {
   if (params.backend === 'supabase') {
     const client = getSupabaseClient();
-    await client.storage.from(supabaseBucket!).remove([params.storageKey]);
+    const { error } = await client.storage.from(supabaseBucket!).remove([params.storageKey]);
+    if (error) {
+      throw new Error(`Failed to delete file from Supabase Storage: ${error.message}`);
+    }
     return;
   }
 
   const safeKeyPath = resolveLocalFilePath(params.storageKey);
-  if (fs.existsSync(safeKeyPath)) {
-    fs.unlinkSync(safeKeyPath);
+  if (await fileExists(safeKeyPath)) {
+    await fs.unlink(safeKeyPath);
     return;
   }
   const legacyFlatPath = resolveLocalFilePath(sanitizeLookupFilename(params.filename));
-  if (fs.existsSync(legacyFlatPath)) {
-    fs.unlinkSync(legacyFlatPath);
+  if (await fileExists(legacyFlatPath)) {
+    await fs.unlink(legacyFlatPath);
   }
 }

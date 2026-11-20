@@ -3,6 +3,7 @@ import { Search, Eye, X, ArrowUpRight } from 'lucide-react';
 import { api } from '../api';
 import type { ComplianceIssue, PageKey, ReviewEvent, Revision, Submission } from '../types';
 import { EmptyState, LoadingPanel, SeverityBadge, StatusBadge } from '../components/ClayUI';
+import { formatDate, formatDateTime } from '../utils/date';
 
 export function HistoryPage({
   onSelectSubmission,
@@ -141,7 +142,7 @@ export function HistoryPage({
                       {s.brand_name}
                     </td>
                     <td className="py-4 px-4 font-mono-tabular text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap">
-                      {new Date(s.created_at + 'Z').toLocaleDateString()}
+                      {formatDate(s.created_at)}
                     </td>
                     <td className="py-4 px-4 font-mono-tabular text-xs font-bold text-right text-slate-900 dark:text-slate-100">
                       {s.open_issues ?? 0} open / {s.total_issues ?? 0}
@@ -196,7 +197,7 @@ export function HistoryPage({
                   <StatusBadge status={inspecting.submission.status} />
                 </div>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                  {inspecting.submission.brand_name} · Submitted {new Date(inspecting.submission.created_at + 'Z').toLocaleString()}
+                  {inspecting.submission.brand_name} · Submitted {formatDateTime(inspecting.submission.created_at)}
                 </p>
               </div>
               <button
@@ -264,7 +265,7 @@ export function HistoryPage({
                         {ev.comment && <p className="text-slate-600 dark:text-slate-300 mt-0.5">{ev.comment}</p>}
                       </div>
                       <span className="font-mono-tabular text-[11px] text-slate-400 whitespace-nowrap">
-                        {new Date(ev.created_at + 'Z').toLocaleString()}
+                        {formatDateTime(ev.created_at)}
                       </span>
                     </div>
                   ))}

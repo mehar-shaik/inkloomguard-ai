@@ -14,6 +14,8 @@ import {
 import { api } from '../api';
 import type { Brand, DashboardData, PageKey } from '../types';
 import { BrandAvatar, EmptyState, LoadingPanel, StatusBadge } from '../components/ClayUI';
+import { ConfirmModal } from '../components/ConfirmModal';
+import { formatDateTime } from '../utils/date';
 import shieldEmblem from '/src/assets/images/inkloom_shield_emblem_1794725371250.jpg';
 
 export function DashboardPage({
@@ -41,6 +43,9 @@ export function DashboardPage({
   const [logoFile, setLogoFile] = useState<File | null>(null);
   const [savingBrand, setSavingBrand] = useState(false);
   const [brandError, setBrandError] = useState('');
+  const [brandToDelete, setBrandToDelete] = useState<Brand | null>(null);
+  const [deletingBrand, setDeletingBrand] = useState(false);
+  const canManageBrands = userRole === 'reviewer';
 
   async function loadDashboard() {
     setLoading(true);
@@ -107,15 +112,18 @@ export function DashboardPage({
     }
   }
 
-  async function handleDeleteBrand(brand: Brand) {
-    if (!window.confirm(`Delete brand "${brand.name}" and all associated guidelines/submissions?`)) {
-      return;
-    }
+  async function handleConfirmDeleteBrand() {
+    if (!brandToDelete) return;
+    setDeletingBrand(true);
     try {
-      await api.deleteBrand(brand.id);
+      await api.deleteBrand(brandToDelete.id);
+      setBrandToDelete(null);
       await loadDashboard();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete brand.');
+      setBrandToDelete(null);
+    } finally {
+      setDeletingBrand(false);
     }
   }
 
@@ -183,14 +191,16 @@ export function DashboardPage({
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-3 shrink-0">
-          <button
-            type="button"
-            onClick={openCreateModal}
-            className="clay-btn-secondary rounded-full px-5 py-2.5 text-sm font-semibold inline-flex items-center gap-2 cursor-pointer whitespace-nowrap"
-          >
-            <Plus className="w-4 h-4" />
-            Add Brand
-          </button>
+          {canManageBrands && (
+            <button
+              type="button"
+              onClick={openCreateModal}
+              className="clay-btn-secondary rounded-full px-5 py-2.5 text-sm font-semibold inline-flex items-center gap-2 cursor-pointer whitespace-nowrap"
+            >
+              <Plus className="w-4 h-4" />
+              Add Brand
+            </button>
+          )}
           <button
             type="button"
             onClick={() => onNavigate('submit')}
@@ -230,25 +240,33 @@ export function DashboardPage({
             <div>
               <h3 className="text-lg font-bold text-slate-900 dark:text-white">Your Brands</h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Manage logos, brand hex palettes, and jump straight to guideline rules.
+                {canManageBrands
+                  ? 'Manage logos, brand hex palettes, and jump straight to guideline rules.'
+                  : 'Inspect brand profiles and view read-only guideline rules configured by reviewers.'}
               </p>
             </div>
-            <button
-              type="button"
-              onClick={openCreateModal}
-              className="clay-btn-secondary rounded-full px-4 py-2 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              New Brand
-            </button>
+            {canManageBrands && (
+              <button
+                type="button"
+                onClick={openCreateModal}
+                className="clay-btn-secondary rounded-full px-4 py-2 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                New Brand
+              </button>
+            )}
           </div>
 
           {data.brands.length === 0 ? (
             <EmptyState
               title="No brands configured yet"
-              description="Add your first brand profile with a logo and brand palette to begin uploading guidelines."
-              actionLabel="Add First Brand"
-              onAction={openCreateModal}
+              description={
+                canManageBrands
+                  ? 'Add your first brand profile with a logo and brand palette to begin uploading guidelines.'
+                  : 'Awaiting a Brand Reviewer to configure the first brand profile for your organization.'
+              }
+              actionLabel={canManageBrands ? 'Add First Brand' : undefined}
+              onAction={canManageBrands ? openCreateModal : undefined}
             />
           ) : (
             <div className="space-y-3">
@@ -289,23 +307,25 @@ export function DashboardPage({
                     >
                       Guidelines
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => openEditModal(brand)}
-                      aria-label={`Edit ${brand.name}`}
-                      className="clay-btn-secondary rounded-full p-2 text-slate-600 dark:text-slate-300 cursor-pointer"
-                    >
-                      <Pencil className="w-3.5 h-3.5" />
-                    </button>
-                    {userRole === 'reviewer' && (
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteBrand(brand)}
-                        aria-label={`Delete ${brand.name}`}
-                        className="clay-btn-secondary rounded-full p-2 text-red-600 dark:text-rose-300 cursor-pointer"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                    {canManageBrands && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => openEditModal(brand)}
+                          aria-label={`Edit ${brand.name}`}
+                          className="clay-btn-secondary rounded-full p-2 text-slate-600 dark:text-slate-300 cursor-pointer"
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setBrandToDelete(brand)}
+                          aria-label={`Delete ${brand.name}`}
+                          className="clay-btn-secondary rounded-full p-2 text-red-600 dark:text-rose-300 cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -358,7 +378,7 @@ export function DashboardPage({
                     <p className="text-xs text-slate-600 dark:text-slate-300 mt-2 line-clamp-2">{item.comment}</p>
                   )}
                   <p className="font-mono-tabular text-[11px] text-slate-400 mt-2">
-                    {new Date(item.created_at + 'Z').toLocaleString()}
+                    {formatDateTime(item.created_at)}
                   </p>
                 </button>
               ))}
@@ -500,6 +520,19 @@ export function DashboardPage({
           </div>
         </div>
       )}
+
+      <ConfirmModal
+        open={Boolean(brandToDelete)}
+        title={brandToDelete ? `Delete "${brandToDelete.name}"?` : 'Delete Brand?'}
+        message="This will permanently remove the brand profile and all associated guidelines, facts, terminology rules, and compliance submissions."
+        confirmLabel="Delete Brand"
+        variant="danger"
+        loading={deletingBrand}
+        onConfirm={handleConfirmDeleteBrand}
+        onCancel={() => {
+          if (!deletingBrand) setBrandToDelete(null);
+        }}
+      />
     </div>
   );
 }

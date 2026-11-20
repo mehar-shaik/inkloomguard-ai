@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowRight, FileSearch, ShieldAlert, Image as ImageIcon } from 'lucide-react';
+import { ArrowRight, FileSearch, ShieldAlert, Image as ImageIcon, RefreshCw, AlertTriangle } from 'lucide-react';
 import { api } from '../api';
 import type { CheckAreaSummary, ComplianceIssue, ImageMetrics, PageKey, Submission } from '../types';
 import { EmptyState, LoadingPanel, ProtectedImage, SeverityBadge, StatusBadge } from '../components/ClayUI';
+import { formatDateTime } from '../utils/date';
 
 export function AnalysisPage({
   selectedSubmissionId,
@@ -17,6 +18,9 @@ export function AnalysisPage({
   const [submission, setSubmission] = useState<Submission | null>(null);
   const [issues, setIssues] = useState<ComplianceIssue[]>([]);
   const [loading, setLoading] = useState(true);
+  const [reanalyzing, setReanalyzing] = useState(false);
+  const [reanalyzeNotice, setReanalyzeNotice] = useState('');
+  const [reanalyzeError, setReanalyzeError] = useState('');
   const [error, setError] = useState('');
 
   async function load(targetId?: number | null) {
@@ -55,6 +59,30 @@ export function AnalysisPage({
   useEffect(() => {
     load(selectedSubmissionId);
   }, [selectedSubmissionId]);
+
+  async function handleReanalyze() {
+    if (!submission || reanalyzing) return;
+    setReanalyzing(true);
+    setReanalyzeNotice('');
+    setReanalyzeError('');
+    try {
+      const res = await api.reanalyzeSubmission(submission.id);
+      setSubmission(res.submission);
+      setIssues(res.issues);
+      setSubmissions((prev) =>
+        prev.map((s) => (s.id === res.submission.id ? { ...s, ...res.submission } : s))
+      );
+      if (res.aiError) {
+        setReanalyzeError(res.aiError);
+      } else {
+        setReanalyzeNotice('Compliance analysis refreshed across all active brand rules.');
+      }
+    } catch (err) {
+      setReanalyzeError(err instanceof Error ? err.message : 'Failed to re-run compliance analysis.');
+    } finally {
+      setReanalyzing(false);
+    }
+  }
 
   if (loading) return <LoadingPanel label="Loading 8-area compliance report..." />;
 
@@ -98,6 +126,9 @@ export function AnalysisPage({
     imageMetrics = null;
   }
 
+  const aiStatus = submission.ai_status || 'completed';
+  const showAiBanner = aiStatus === 'partial' || aiStatus === 'failed' || Boolean(submission.ai_error);
+
   return (
     <div className="space-y-6">
       {/* Submission Picker & Header */}
@@ -106,10 +137,20 @@ export function AnalysisPage({
           <div className="flex flex-wrap items-center gap-2.5">
             <h2 className="text-xl font-extrabold text-slate-900 dark:text-white">{submission.title}</h2>
             <StatusBadge status={submission.status} />
+            {typeof submission.compliance_score === 'number' && (
+              <span className="inline-flex items-center rounded-full px-3 py-1 text-xs font-bold font-mono-tabular bg-indigo-50 text-indigo-800 border border-indigo-200/80 dark:bg-violet-500/15 dark:text-violet-200 dark:border-violet-400/35">
+                Score: {submission.compliance_score}/100
+              </span>
+            )}
+            {typeof submission.analysis_coverage === 'number' && (
+              <span className="inline-flex items-center rounded-full px-3 py-1 text-xs font-bold font-mono-tabular bg-slate-100 text-slate-700 border border-slate-200/80 dark:bg-slate-800/70 dark:text-slate-200 dark:border-slate-700">
+                Coverage: {submission.analysis_coverage}%
+              </span>
+            )}
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400">
             Brand: <strong className="text-slate-700 dark:text-slate-200">{submission.brand_name}</strong> · Input:{' '}
-            {submission.input_type} · Submitted {new Date(submission.created_at + 'Z').toLocaleString()}
+            {submission.input_type} · Submitted {formatDateTime(submission.created_at)}
           </p>
         </div>
 
@@ -128,6 +169,15 @@ export function AnalysisPage({
           </select>
           <button
             type="button"
+            disabled={reanalyzing}
+            onClick={handleReanalyze}
+            className="clay-btn-secondary rounded-full px-4 py-2.5 text-xs font-bold inline-flex items-center gap-2 cursor-pointer whitespace-nowrap disabled:opacity-60"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${reanalyzing ? 'animate-spin' : ''}`} />
+            {reanalyzing ? 'Analyzing...' : 'Re-run Analysis'}
+          </button>
+          <button
+            type="button"
             onClick={() => onNavigate('corrections')}
             className="clay-btn-primary rounded-full px-5 py-2.5 text-xs font-bold inline-flex items-center gap-2 cursor-pointer whitespace-nowrap"
           >
@@ -136,6 +186,54 @@ export function AnalysisPage({
           </button>
         </div>
       </section>
+
+      {reanalyzeNotice && (
+        <div className="rounded-2xl px-4 py-3 text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 dark:bg-emerald-500/15 dark:text-emerald-200 dark:border-emerald-400/30">
+          {reanalyzeNotice}
+        </div>
+      )}
+
+      {reanalyzeError && (
+        <div className="rounded-2xl px-4 py-3 text-xs font-semibold bg-red-50 text-red-800 border border-red-200 dark:bg-rose-500/15 dark:text-rose-200 dark:border-rose-400/30">
+          {reanalyzeError}
+        </div>
+      )}
+
+      {showAiBanner && (
+        <section
+          role="status"
+          className={`rounded-[24px] p-4 sm:p-5 border flex flex-col sm:flex-row sm:items-center justify-between gap-4 ${
+            aiStatus === 'failed'
+              ? 'bg-red-50/90 text-red-900 border-red-200 dark:bg-rose-500/15 dark:text-rose-200 dark:border-rose-400/30'
+              : 'bg-amber-50/90 text-amber-900 border-amber-200 dark:bg-amber-500/15 dark:text-amber-200 dark:border-amber-400/30'
+          }`}
+        >
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-extrabold uppercase tracking-wider">
+                  {aiStatus === 'failed' ? 'AI Compliance Evaluation Failed' : 'Partial Compliance Evaluation'}
+                </span>
+                <StatusBadge status={aiStatus} />
+              </div>
+              <p className="text-xs leading-relaxed">
+                {submission.ai_error ||
+                  'AI tone and messaging evaluation could not be completed. Deterministic terminology, fact, and accessibility checks remain available.'}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={reanalyzing}
+            onClick={handleReanalyze}
+            className="clay-btn-primary rounded-full px-4 py-2 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer shrink-0 disabled:opacity-60"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${reanalyzing ? 'animate-spin' : ''}`} />
+            {reanalyzing ? 'Retrying...' : 'Retry AI Analysis'}
+          </button>
+        </section>
+      )}
 
       {/* 8-Area Compliance Grid */}
       <section className="clay-surface rounded-[28px] p-6 sm:p-7">
@@ -187,13 +285,17 @@ export function AnalysisPage({
                 </p>
               </div>
               <div className="clay-well rounded-xl p-3">
-                <p className="text-slate-500 dark:text-slate-400">Contrast Spread</p>
+                <p className="text-slate-500 dark:text-slate-400">
+                  {typeof imageMetrics.wcagContrastRatio === 'number' ? 'WCAG Contrast' : 'Luminance Spread'}
+                </p>
                 <p className="font-mono-tabular font-bold text-slate-900 dark:text-white mt-0.5">
-                  {imageMetrics.contrastSpread}:1
+                  {typeof imageMetrics.wcagContrastRatio === 'number'
+                    ? `${imageMetrics.wcagContrastRatio}:1 (${imageMetrics.wcagAA ? 'AA' : imageMetrics.wcagAALarge ? 'AA Large' : 'Low'})`
+                    : `${imageMetrics.contrastSpread}:1`}
                 </p>
               </div>
               <div className="clay-well rounded-xl p-3">
-                <p className="text-slate-500 dark:text-slate-400">Brand Color Dist.</p>
+                <p className="text-slate-500 dark:text-slate-400">Brand Delta-E</p>
                 <p className="font-mono-tabular font-bold text-slate-900 dark:text-white mt-0.5">
                   {imageMetrics.brandPrimaryMatchDistance ?? 'N/A'}
                 </p>
