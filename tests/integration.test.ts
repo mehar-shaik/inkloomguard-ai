@@ -286,15 +286,15 @@ async function runUnitChecks() {
   const syntheticSmtpFixture = ['fixture', 'smtp', 'redact', 'check'].join('-');
   const syntheticRelayUser = 'test-relay-account.example';
 
-  // Invalid SMTP configurations must be rejected cleanly
+  // Invalid SMTP configurations (port out of range, YOUR_*/REPLACE_WITH_* placeholders, invalid FROM) must be rejected cleanly
   process.env.SMTP_HOST = 'smtp-relay.brevo.com';
   process.env.SMTP_PORT = '99999';
-  process.env.SMTP_USER = syntheticRelayUser;
-  process.env.SMTP_PASSWORD = 'REPLACE_WITH_SMTP_PASSWORD_OR_KEY';
+  process.env.SMTP_USER = 'YOUR_SMTP_LOGIN';
+  process.env.SMTP_PASSWORD = 'REPLACE_WITH_YOUR_SMTP_PASSWORD';
   process.env.SMTP_FROM = 'invalid-from-without-at';
   const invalidSmtp = validateSmtpConfig();
   assert.equal(invalidSmtp.configured, false);
-  assert.deepEqual(invalidSmtp.missing, ['SMTP_PORT', 'SMTP_PASSWORD', 'SMTP_FROM']);
+  assert.deepEqual(invalidSmtp.missing, ['SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM']);
 
   // Valid Brevo SMTP configuration on port 587 (STARTTLS: secure=false, requireTLS=true)
   process.env.SMTP_HOST = 'smtp-relay.brevo.com';
@@ -1143,488 +1143,497 @@ async function main() {
     const mockSenderAddress = 'mock-sender@example.test';
     const mockFromHeader = `InkloomGuard AI <${mockSenderAddress}>`;
 
-    process.env.SMTP_HOST = 'smtp-relay.brevo.com';
-    process.env.SMTP_PORT = '587';
-    process.env.SMTP_USER = mockSenderAddress;
-    process.env.SMTP_PASSWORD = mockSmtpFixture;
-    process.env.SMTP_FROM = mockFromHeader;
+    try {
+      process.env.SMTP_HOST = 'smtp-relay.brevo.com';
+      process.env.SMTP_PORT = '587';
+      process.env.SMTP_USER = mockSenderAddress;
+      process.env.SMTP_PASSWORD = mockSmtpFixture;
+      process.env.SMTP_FROM = mockFromHeader;
 
-    const smtpDiag = getSmtpDiagnostics();
-    assert.equal(smtpDiag.configured, true);
-    assert.equal(smtpDiag.host, 'smtp-relay.brevo.com');
-    assert.equal(smtpDiag.port, 587);
-    assert.equal(smtpDiag.secure, false);
-    assert.equal(smtpDiag.starttls, true);
-    assert.ok(!JSON.stringify(smtpDiag).includes(mockSmtpFixture));
-    assert.ok(!JSON.stringify(smtpDiag).includes(mockSenderAddress));
+      const smtpDiag = getSmtpDiagnostics();
+      assert.equal(smtpDiag.configured, true);
+      assert.equal(smtpDiag.host, 'smtp-relay.brevo.com');
+      assert.equal(smtpDiag.port, 587);
+      assert.equal(smtpDiag.secure, false);
+      assert.equal(smtpDiag.starttls, true);
+      assert.ok(!JSON.stringify(smtpDiag).includes(mockSmtpFixture));
+      assert.ok(!JSON.stringify(smtpDiag).includes(mockSenderAddress));
 
-    const capturedTransportOptions: Array<Record<string, unknown>> = [];
-    const sentEmails: Array<{ from?: string; to: string; subject: string; html: string; text: string }> = [];
-    let smtpErrorToThrow: Error | null = null;
+      const capturedTransportOptions: Array<Record<string, unknown>> = [];
+      const sentEmails: Array<{ from?: string; to: string; subject: string; html: string; text: string }> = [];
+      let smtpErrorToThrow: Error | null = null;
 
-    setCreateTransportForTesting((options) => {
-      capturedTransportOptions.push(options);
-      return {
-        sendMail: async (mail: { from?: string; to: string; subject: string; html: string; text: string }) => {
-          if (smtpErrorToThrow) {
-            throw smtpErrorToThrow;
-          }
-          sentEmails.push(mail);
-          return { messageId: `<mock-${sentEmails.length}@relay.test>` };
-        },
-      } as unknown as import('nodemailer').Transporter;
-    });
+      setCreateTransportForTesting((options) => {
+        capturedTransportOptions.push(options);
+        return {
+          sendMail: async (mail: { from?: string; to: string; subject: string; html: string; text: string }) => {
+            if (smtpErrorToThrow) {
+              throw smtpErrorToThrow;
+            }
+            sentEmails.push(mail);
+            return { messageId: `<mock-${sentEmails.length}@relay.test>` };
+          },
+        } as unknown as import('nodemailer').Transporter;
+      });
 
-    // 9a. Weak password rejected on registration
-    const weakRegRes = await req('/api/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: 'Weak User',
-        email: 'weak@novapay-ci.test',
-        password: 'password',
-        companyName: 'WeakOrg',
-        role: 'reviewer',
-      }),
-    });
-    assert.equal(weakRegRes.status, 400);
-
-    // 9b. Existing pre-migration / legacy unverified user compatibility (never locked out, never silently marked verified)
-    const demoLoginRes = await req('/api/auth/demo', { method: 'POST' });
-    assert.equal(demoLoginRes.status, 200);
-    assert.equal(demoLoginRes.json!.user.emailVerified, false);
-    assert.equal(demoLoginRes.json!.user.verificationRequired, false);
-
-    // 9c. Registration sends verification email via Brevo SMTP Nodemailer, stores ONLY token hash, and verifies once
-    sentEmails.length = 0;
-    const secRegRes = await req('/api/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: 'Sam Security',
-        email: 'sam.security@novapay-ci.test',
-        password: 'Password123!',
-        companyName: 'SecOrg',
-        role: 'reviewer',
-      }),
-    });
-    assert.equal(secRegRes.status, 201);
-    assert.equal(secRegRes.json!.verificationEmailSent, true);
-    assert.equal(secRegRes.json!.user.emailVerified, false);
-    assert.equal(capturedTransportOptions.length, 1);
-    assert.equal(capturedTransportOptions[0].host, 'smtp-relay.brevo.com');
-    assert.equal(capturedTransportOptions[0].port, 587);
-    assert.equal(capturedTransportOptions[0].secure, false);
-    assert.equal(capturedTransportOptions[0].requireTLS, true);
-    assert.deepEqual(capturedTransportOptions[0].auth, {
-      user: mockSenderAddress,
-      pass: mockSmtpFixture,
-    });
-    assert.equal(sentEmails.length, 1);
-    assert.equal(sentEmails[0].from, mockFromHeader);
-    assert.match(sentEmails[0].html, /InkloomGuard AI/);
-    assert.match(sentEmails[0].html, /Check\. Correct\. Comply\./);
-    const verifyMatch = sentEmails[0].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
-    assert.ok(verifyMatch && verifyMatch[1], 'Verification email should contain raw token URL');
-    const rawVerifyToken = verifyMatch[1];
-
-    // Raw token must NEVER be stored in database (only its SHA-256 hash)
-    const storedVerifyRow = await db.get<{ token_hash: string; used_at: string | null }>(
-      'SELECT token_hash, used_at FROM email_verification_tokens WHERE user_id = ? ORDER BY id DESC LIMIT 1',
-      secRegRes.json!.user.id
-    );
-    assert.ok(storedVerifyRow);
-    assert.notEqual(storedVerifyRow.token_hash, rawVerifyToken);
-    assert.equal(storedVerifyRow.token_hash, hashSecurityToken(rawVerifyToken));
-    assert.equal(storedVerifyRow.used_at, null);
-
-    // Expired verification token rejected
-    await db.run(
-      'UPDATE email_verification_tokens SET expires_at = ? WHERE token_hash = ?',
-      new Date(Date.now() - 60_000).toISOString(),
-      storedVerifyRow.token_hash
-    );
-    const expiredVerifyRes = await req('/api/auth/verify-email', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: rawVerifyToken }),
-    });
-    assert.equal(expiredVerifyRes.status, 400);
-    assert.equal(expiredVerifyRes.json!.reason, 'expired');
-
-    // Resend verification creates a fresh token & succeeds via same SMTP transporter
-    let samToken = secRegRes.json!.token as string;
-    sentEmails.length = 0;
-    const resendVerifyRes = await req('/api/auth/resend-verification', {
-      method: 'POST',
-      headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({}),
-    });
-    assert.equal(resendVerifyRes.status, 200);
-    assert.equal(sentEmails.length, 1);
-    assert.equal(sentEmails[0].from, mockFromHeader);
-    assert.equal(capturedTransportOptions.length, 1); // Reused singleton transporter
-    const freshVerifyMatch = sentEmails[0].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
-    assert.ok(freshVerifyMatch && freshVerifyMatch[1]);
-    const freshVerifyToken = freshVerifyMatch[1];
-
-    // SMTP failure reporting: formats EAUTH clearly in a provider-neutral way without leaking secrets
-    smtpErrorToThrow = Object.assign(
-      new Error(`535-5.7.8 Authentication failed for ${mockSenderAddress} ${mockSmtpFixture}`),
-      {
-        code: 'EAUTH',
-        responseCode: 535,
-      }
-    );
-    await assert.rejects(
-      () =>
-        sendEmail({
-          to: 'sam.security@novapay-ci.test',
-          subject: 'Test',
-          html: '<p>Test</p>',
-          text: 'Test',
+      // 9a. Weak password rejected on registration
+      const weakRegRes = await req('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Weak User',
+          email: 'weak@novapay-ci.test',
+          password: 'password',
+          companyName: 'WeakOrg',
+          role: 'reviewer',
         }),
-      (err: Error) => {
-        assert.match(err.message, /SMTP authentication failed/i);
-        assert.equal(/Gmail/i.test(err.message), false);
-        assert.ok(!err.message.includes(mockSmtpFixture));
-        assert.ok(!err.message.includes(mockSenderAddress));
-        return true;
-      }
-    );
+      });
+      assert.equal(weakRegRes.status, 400);
 
-    const failResendRes = await req('/api/auth/resend-verification', {
-      method: 'POST',
-      headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({}),
-    });
-    assert.equal(failResendRes.status, 503);
-    assert.ok(!failResendRes.text.includes(mockSmtpFixture));
-    assert.ok(!failResendRes.text.includes(mockSenderAddress));
-    assert.ok(!failResendRes.text.includes('535-5.7.8'));
-    smtpErrorToThrow = null;
+      // 9b. Existing pre-migration / legacy unverified user compatibility (never locked out, never silently marked verified)
+      const demoLoginRes = await req('/api/auth/demo', { method: 'POST' });
+      assert.equal(demoLoginRes.status, 200);
+      assert.equal(demoLoginRes.json!.user.emailVerified, false);
+      assert.equal(demoLoginRes.json!.user.verificationRequired, false);
 
-    // Resend verification rate limiting (3 attempts per 15 min -> 4th returns 429)
-    const resend3 = await req('/api/auth/resend-verification', {
-      method: 'POST',
-      headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({}),
-    });
-    assert.equal(resend3.status, 200);
-    const latestVerifyMatch = sentEmails[sentEmails.length - 1].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
-    assert.ok(latestVerifyMatch && latestVerifyMatch[1]);
-    const latestVerifyToken = latestVerifyMatch[1];
+      // 9c. Registration sends verification email via Brevo SMTP Nodemailer, stores ONLY token hash, and verifies once
+      sentEmails.length = 0;
+      const secRegRes = await req('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Sam Security',
+          email: 'sam.security@novapay-ci.test',
+          password: 'Password123!',
+          companyName: 'SecOrg',
+          role: 'reviewer',
+        }),
+      });
+      assert.equal(secRegRes.status, 201);
+      assert.equal(secRegRes.json!.verificationEmailSent, true);
+      assert.equal(secRegRes.json!.user.emailVerified, false);
+      assert.equal(capturedTransportOptions.length, 1);
+      assert.equal(capturedTransportOptions[0].host, 'smtp-relay.brevo.com');
+      assert.equal(capturedTransportOptions[0].port, 587);
+      assert.equal(capturedTransportOptions[0].secure, false);
+      assert.equal(capturedTransportOptions[0].requireTLS, true);
+      assert.deepEqual(capturedTransportOptions[0].auth, {
+        user: mockSenderAddress,
+        pass: mockSmtpFixture,
+      });
+      assert.equal(sentEmails.length, 1);
+      assert.equal(sentEmails[0].from, mockFromHeader);
+      assert.match(sentEmails[0].html, /InkloomGuard AI/);
+      assert.match(sentEmails[0].html, /Check\. Correct\. Comply\./);
+      const verifyMatch = sentEmails[0].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
+      assert.ok(verifyMatch && verifyMatch[1], 'Verification email should contain raw token URL');
+      const rawVerifyToken = verifyMatch[1];
 
-    const resend4RateLimited = await req('/api/auth/resend-verification', {
-      method: 'POST',
-      headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({}),
-    });
-    assert.equal(resend4RateLimited.status, 429);
+      // Raw token must NEVER be stored in database (only its SHA-256 hash)
+      const storedVerifyRow = await db.get<{ token_hash: string; used_at: string | null }>(
+        'SELECT token_hash, used_at FROM email_verification_tokens WHERE user_id = ? ORDER BY id DESC LIMIT 1',
+        secRegRes.json!.user.id
+      );
+      assert.ok(storedVerifyRow);
+      assert.notEqual(storedVerifyRow.token_hash, rawVerifyToken);
+      assert.equal(storedVerifyRow.token_hash, hashSecurityToken(rawVerifyToken));
+      assert.equal(storedVerifyRow.used_at, null);
 
-    // Valid verification succeeds & marks user verified
-    const validVerifyRes = await req('/api/auth/verify-email', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: latestVerifyToken }),
-    });
-    assert.equal(validVerifyRes.status, 200);
-    assert.equal(validVerifyRes.json!.ok, true);
-    assert.equal(validVerifyRes.json!.user.emailVerified, true);
+      // Expired verification token rejected
+      await db.run(
+        'UPDATE email_verification_tokens SET expires_at = ? WHERE token_hash = ?',
+        new Date(Date.now() - 60_000).toISOString(),
+        storedVerifyRow.token_hash
+      );
+      const expiredVerifyRes = await req('/api/auth/verify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: rawVerifyToken }),
+      });
+      assert.equal(expiredVerifyRes.status, 400);
+      assert.equal(expiredVerifyRes.json!.reason, 'expired');
 
-    // Reused / duplicate verification token rejected
-    const reusedVerifyRes = await req('/api/auth/verify-email', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: latestVerifyToken }),
-    });
-    assert.equal(reusedVerifyRes.status, 400);
+      // Resend verification creates a fresh token & succeeds via same SMTP transporter
+      let samToken = secRegRes.json!.token as string;
+      sentEmails.length = 0;
+      const resendVerifyRes = await req('/api/auth/resend-verification', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({}),
+      });
+      assert.equal(resendVerifyRes.status, 200);
+      assert.equal(sentEmails.length, 1);
+      assert.equal(sentEmails[0].from, mockFromHeader);
+      assert.equal(capturedTransportOptions.length, 1); // Reused singleton transporter
+      const freshVerifyMatch = sentEmails[0].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
+      assert.ok(freshVerifyMatch && freshVerifyMatch[1]);
+      const freshVerifyToken = freshVerifyMatch[1];
 
-    // Prior invalidated verification token also rejected
-    const oldVerifyRes = await req('/api/auth/verify-email', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: freshVerifyToken }),
-    });
-    assert.equal(oldVerifyRes.status, 400);
+      // SMTP failure reporting: formats EAUTH clearly in a provider-neutral way without leaking secrets
+      smtpErrorToThrow = Object.assign(
+        new Error(`535-5.7.8 Authentication failed for ${mockSenderAddress} ${mockSmtpFixture}`),
+        {
+          code: 'EAUTH',
+          responseCode: 535,
+        }
+      );
+      await assert.rejects(
+        () =>
+          sendEmail({
+            to: 'sam.security@novapay-ci.test',
+            subject: 'Test',
+            html: '<p>Test</p>',
+            text: 'Test',
+          }),
+        (err: Error) => {
+          assert.match(err.message, /SMTP authentication failed/i);
+          assert.equal(/Gmail/i.test(err.message), false);
+          assert.ok(!err.message.includes(mockSmtpFixture));
+          assert.ok(!err.message.includes(mockSenderAddress));
+          return true;
+        }
+      );
 
-    // 9d. Unauthorized access rejected on protected account security routes
-    const unauthChangePw = await req('/api/auth/change-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        currentPassword: 'Password123!',
-        newPassword: 'NewPassword123!',
-        confirmPassword: 'NewPassword123!',
-      }),
-    });
-    assert.equal(unauthChangePw.status, 401);
-    const unauthLogoutAll = await req('/api/auth/logout-all', { method: 'POST' });
-    assert.equal(unauthLogoutAll.status, 401);
+      const failResendRes = await req('/api/auth/resend-verification', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({}),
+      });
+      assert.equal(failResendRes.status, 503);
+      assert.ok(!failResendRes.text.includes(mockSmtpFixture));
+      assert.ok(!failResendRes.text.includes(mockSenderAddress));
+      assert.ok(!failResendRes.text.includes('535-5.7.8'));
+      smtpErrorToThrow = null;
 
-    // 9e. Change Password validations & session invalidation
-    // Incorrect current password
-    const wrongCurrentPw = await req('/api/auth/change-password', {
-      method: 'POST',
-      headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        currentPassword: 'WrongPassword123!',
-        newPassword: 'NewPassword123!',
-        confirmPassword: 'NewPassword123!',
-      }),
-    });
-    assert.equal(wrongCurrentPw.status, 400);
+      // Resend verification rate limiting (3 attempts per 15 min -> 4th returns 429)
+      const resend3 = await req('/api/auth/resend-verification', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({}),
+      });
+      assert.equal(resend3.status, 200);
+      const latestVerifyMatch = sentEmails[sentEmails.length - 1].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
+      assert.ok(latestVerifyMatch && latestVerifyMatch[1]);
+      const latestVerifyToken = latestVerifyMatch[1];
 
-    // Reuse of current password rejected
-    const reuseSamePw = await req('/api/auth/change-password', {
-      method: 'POST',
-      headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        currentPassword: 'Password123!',
-        newPassword: 'Password123!',
-        confirmPassword: 'Password123!',
-      }),
-    });
-    assert.equal(reuseSamePw.status, 400);
+      const resend4RateLimited = await req('/api/auth/resend-verification', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({}),
+      });
+      assert.equal(resend4RateLimited.status, 429);
 
-    // Weak new password rejected
-    const weakChangePw = await req('/api/auth/change-password', {
-      method: 'POST',
-      headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        currentPassword: 'Password123!',
-        newPassword: 'weak',
-        confirmPassword: 'weak',
-      }),
-    });
-    assert.equal(weakChangePw.status, 400);
+      // Valid verification succeeds & marks user verified
+      const validVerifyRes = await req('/api/auth/verify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: latestVerifyToken }),
+      });
+      assert.equal(validVerifyRes.status, 200);
+      assert.equal(validVerifyRes.json!.ok, true);
+      assert.equal(validVerifyRes.json!.user.emailVerified, true);
 
-    // Password confirmation mismatch rejected
-    const mismatchChangePw = await req('/api/auth/change-password', {
-      method: 'POST',
-      headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        currentPassword: 'Password123!',
-        newPassword: 'NewPassword123!',
-        confirmPassword: 'DifferentPassword123!',
-      }),
-    });
-    assert.equal(mismatchChangePw.status, 400);
+      // Reused / duplicate verification token rejected
+      const reusedVerifyRes = await req('/api/auth/verify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: latestVerifyToken }),
+      });
+      assert.equal(reusedVerifyRes.status, 400);
 
-    // Create a second active session for Sam before changing password
-    const secondLoginRes = await req('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'sam.security@novapay-ci.test', password: 'Password123!' }),
-    });
-    assert.equal(secondLoginRes.status, 200);
-    const samOtherDeviceToken = secondLoginRes.json!.token as string;
+      // Prior invalidated verification token also rejected
+      const oldVerifyRes = await req('/api/auth/verify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: freshVerifyToken }),
+      });
+      assert.equal(oldVerifyRes.status, 400);
 
-    // Successful password change rotates token, keeps current session alive, invalidates other session, sends email
-    sentEmails.length = 0;
-    const changePwSuccess = await req('/api/auth/change-password', {
-      method: 'POST',
-      headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        currentPassword: 'Password123!',
-        newPassword: 'NewPassword123!',
-        confirmPassword: 'NewPassword123!',
-      }),
-    });
-    assert.equal(changePwSuccess.status, 200);
-    assert.equal(changePwSuccess.json!.ok, true);
-    assert.equal(changePwSuccess.json!.confirmationEmailSent, true);
-    assert.ok(changePwSuccess.json!.token);
-    assert.equal(sentEmails.length, 1);
-    assert.match(sentEmails[0].subject, /password was changed/i);
+      // 9d. Unauthorized access rejected on protected account security routes
+      const unauthChangePw = await req('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentPassword: 'Password123!',
+          newPassword: 'NewPassword123!',
+          confirmPassword: 'NewPassword123!',
+        }),
+      });
+      assert.equal(unauthChangePw.status, 401);
+      const unauthLogoutAll = await req('/api/auth/logout-all', { method: 'POST' });
+      assert.equal(unauthLogoutAll.status, 401);
 
-    const samNewToken = changePwSuccess.json!.token as string;
-    const oldDeviceMe = await req('/api/auth/me', { headers: authHdr(samOtherDeviceToken) });
-    assert.equal(oldDeviceMe.status, 401);
-    const oldCurrentMe = await req('/api/auth/me', { headers: authHdr(samToken) });
-    assert.equal(oldCurrentMe.status, 401);
-    const newCurrentMe = await req('/api/auth/me', { headers: authHdr(samNewToken) });
-    assert.equal(newCurrentMe.status, 200);
-    samToken = samNewToken;
+      // 9e. Change Password validations & session invalidation
+      // Incorrect current password
+      const wrongCurrentPw = await req('/api/auth/change-password', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          currentPassword: 'WrongPassword123!',
+          newPassword: 'NewPassword123!',
+          confirmPassword: 'NewPassword123!',
+        }),
+      });
+      assert.equal(wrongCurrentPw.status, 400);
 
-    // 9f. Forgot Password & Reset Password workflows
-    // Unknown email returns identical neutral 200 and sends NO email
-    sentEmails.length = 0;
-    const unknownForgot = await req('/api/auth/forgot-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'nobody.unknown@novapay-ci.test' }),
-    });
-    assert.equal(unknownForgot.status, 200);
-    assert.equal(sentEmails.length, 0);
+      // Reuse of current password rejected
+      const reuseSamePw = await req('/api/auth/change-password', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          currentPassword: 'Password123!',
+          newPassword: 'Password123!',
+          confirmPassword: 'Password123!',
+        }),
+      });
+      assert.equal(reuseSamePw.status, 400);
 
-    // Known email returns identical neutral 200, stores hash only, sends branded reset email
-    const knownForgot = await req('/api/auth/forgot-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'sam.security@novapay-ci.test' }),
-    });
-    assert.equal(knownForgot.status, 200);
-    assert.equal(knownForgot.json!.message, unknownForgot.json!.message);
-    assert.equal(sentEmails.length, 1);
-    assert.match(sentEmails[0].html, /Check\. Correct\. Comply\./);
-    const resetMatch = sentEmails[0].text.match(/mode=reset-password&token=([a-f0-9]+)/i);
-    assert.ok(resetMatch && resetMatch[1]);
-    const rawResetToken = resetMatch[1];
+      // Weak new password rejected
+      const weakChangePw = await req('/api/auth/change-password', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          currentPassword: 'Password123!',
+          newPassword: 'weak',
+          confirmPassword: 'weak',
+        }),
+      });
+      assert.equal(weakChangePw.status, 400);
 
-    // Verify reset token stored as hash, never plaintext
-    const storedResetRow = await db.get<{ token_hash: string; used_at: string | null }>(
-      'SELECT token_hash, used_at FROM password_reset_tokens WHERE user_id = ? ORDER BY id DESC LIMIT 1',
-      secRegRes.json!.user.id
-    );
-    assert.ok(storedResetRow);
-    assert.notEqual(storedResetRow.token_hash, rawResetToken);
-    assert.equal(storedResetRow.token_hash, hashSecurityToken(rawResetToken));
+      // Password confirmation mismatch rejected
+      const mismatchChangePw = await req('/api/auth/change-password', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          currentPassword: 'Password123!',
+          newPassword: 'NewPassword123!',
+          confirmPassword: 'DifferentPassword123!',
+        }),
+      });
+      assert.equal(mismatchChangePw.status, 400);
 
-    // Invalid reset token rejected
-    const invalidResetValidate = await req('/api/auth/reset-password/validate?token=deadbeef');
-    assert.equal(invalidResetValidate.status, 400);
-    const invalidResetPost = await req('/api/auth/reset-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token: 'a'.repeat(64),
-        newPassword: 'ResetPassword123!',
-        confirmPassword: 'ResetPassword123!',
-      }),
-    });
-    assert.equal(invalidResetPost.status, 400);
+      // Create a second active session for Sam before changing password
+      const secondLoginRes = await req('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sam.security@novapay-ci.test', password: 'Password123!' }),
+      });
+      assert.equal(secondLoginRes.status, 200);
+      const samOtherDeviceToken = secondLoginRes.json!.token as string;
 
-    // Expired reset token rejected
-    await db.run(
-      'UPDATE password_reset_tokens SET expires_at = ? WHERE token_hash = ?',
-      new Date(Date.now() - 60_000).toISOString(),
-      storedResetRow.token_hash
-    );
-    const expiredResetValidate = await req(`/api/auth/reset-password/validate?token=${rawResetToken}`);
-    assert.equal(expiredResetValidate.status, 400);
-    assert.equal(expiredResetValidate.json!.reason, 'expired');
-    const expiredResetPost = await req('/api/auth/reset-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token: rawResetToken,
-        newPassword: 'ResetPassword123!',
-        confirmPassword: 'ResetPassword123!',
-      }),
-    });
-    assert.equal(expiredResetPost.status, 400);
+      // Successful password change rotates token, keeps current session alive, invalidates other session, sends email
+      sentEmails.length = 0;
+      const changePwSuccess = await req('/api/auth/change-password', {
+        method: 'POST',
+        headers: authHdr(samToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          currentPassword: 'Password123!',
+          newPassword: 'NewPassword123!',
+          confirmPassword: 'NewPassword123!',
+        }),
+      });
+      assert.equal(changePwSuccess.status, 200);
+      assert.equal(changePwSuccess.json!.ok, true);
+      assert.equal(changePwSuccess.json!.confirmationEmailSent, true);
+      assert.ok(changePwSuccess.json!.token);
+      assert.equal(sentEmails.length, 1);
+      assert.match(sentEmails[0].subject, /password was changed/i);
 
-    // Request another valid reset token and complete reset
-    sentEmails.length = 0;
-    const validForgot = await req('/api/auth/forgot-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'sam.security@novapay-ci.test' }),
-    });
-    assert.equal(validForgot.status, 200);
-    const validResetMatch = sentEmails[0].text.match(/mode=reset-password&token=([a-f0-9]+)/i);
-    assert.ok(validResetMatch && validResetMatch[1]);
-    const validResetToken = validResetMatch[1];
+      const samNewToken = changePwSuccess.json!.token as string;
+      const oldDeviceMe = await req('/api/auth/me', { headers: authHdr(samOtherDeviceToken) });
+      assert.equal(oldDeviceMe.status, 401);
+      const oldCurrentMe = await req('/api/auth/me', { headers: authHdr(samToken) });
+      assert.equal(oldCurrentMe.status, 401);
+      const newCurrentMe = await req('/api/auth/me', { headers: authHdr(samNewToken) });
+      assert.equal(newCurrentMe.status, 200);
+      samToken = samNewToken;
 
-    const checkValidToken = await req(`/api/auth/reset-password/validate?token=${validResetToken}`);
-    assert.equal(checkValidToken.status, 200);
-    assert.equal(checkValidToken.json!.valid, true);
-
-    // Weak password & mismatch rejected on reset
-    const weakResetPost = await req('/api/auth/reset-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token: validResetToken,
-        newPassword: 'short',
-        confirmPassword: 'short',
-      }),
-    });
-    assert.equal(weakResetPost.status, 400);
-
-    const mismatchResetPost = await req('/api/auth/reset-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token: validResetToken,
-        newPassword: 'ResetPassword123!',
-        confirmPassword: 'MismatchPassword123!',
-      }),
-    });
-    assert.equal(mismatchResetPost.status, 400);
-
-    // Complete password reset -> invalidates existing sessions & sends confirmation email
-    sentEmails.length = 0;
-    const resetOk = await req('/api/auth/reset-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token: validResetToken,
-        newPassword: 'ResetPassword123!',
-        confirmPassword: 'ResetPassword123!',
-      }),
-    });
-    assert.equal(resetOk.status, 200);
-    assert.equal(sentEmails.length, 1);
-    assert.equal(sentEmails[0].from, mockFromHeader);
-    assert.equal(capturedTransportOptions.length, 1);
-    assert.match(sentEmails[0].subject, /password was changed/i);
-
-    // Previous active session is now invalidated
-    const preResetMe = await req('/api/auth/me', { headers: authHdr(samToken) });
-    assert.equal(preResetMe.status, 401);
-
-    // Reused reset token rejected
-    const reusedResetPost = await req('/api/auth/reset-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token: validResetToken,
-        newPassword: 'AnotherPassword123!',
-        confirmPassword: 'AnotherPassword123!',
-      }),
-    });
-    assert.equal(reusedResetPost.status, 400);
-
-    // Login with new password succeeds
-    const postResetLogin = await req('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'sam.security@novapay-ci.test', password: 'ResetPassword123!' }),
-    });
-    assert.equal(postResetLogin.status, 200);
-
-    // Logout-all invalidates session immediately
-    const postResetToken = postResetLogin.json!.token as string;
-    const logoutAllRes = await req('/api/auth/logout-all', {
-      method: 'POST',
-      headers: authHdr(postResetToken),
-    });
-    assert.equal(logoutAllRes.status, 200);
-    const afterLogoutAllMe = await req('/api/auth/me', { headers: authHdr(postResetToken) });
-    assert.equal(afterLogoutAllMe.status, 401);
-
-    // Forgot-password rate limiting check (5 per 15 min -> 6th returns 429)
-    for (let i = 0; i < 2; i++) {
-      await req('/api/auth/forgot-password', {
+      // 9f. Forgot Password & Reset Password workflows
+      // Unknown email returns identical neutral 200 and sends NO email
+      sentEmails.length = 0;
+      const unknownForgot = await req('/api/auth/forgot-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: 'nobody.unknown@novapay-ci.test' }),
       });
-    }
-    const forgotLimited = await req('/api/auth/forgot-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'nobody.unknown@novapay-ci.test' }),
-    });
-    assert.equal(forgotLimited.status, 429);
+      assert.equal(unknownForgot.status, 200);
+      assert.equal(sentEmails.length, 0);
 
-    // Repeated non-destructive schema migration preserves auth token tables & user records
-    const usersCountBefore = await db.get<{ c: number }>('SELECT COUNT(*) AS c FROM users');
-    await runMigrations();
-    const usersCountAfter = await db.get<{ c: number }>('SELECT COUNT(*) AS c FROM users');
-    assert.equal(usersCountAfter?.c, usersCountBefore?.c);
+      // Known email returns identical neutral 200, stores hash only, sends branded reset email
+      const knownForgot = await req('/api/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sam.security@novapay-ci.test' }),
+      });
+      assert.equal(knownForgot.status, 200);
+      assert.equal(knownForgot.json!.message, unknownForgot.json!.message);
+      assert.equal(sentEmails.length, 1);
+      assert.match(sentEmails[0].html, /Check\. Correct\. Comply\./);
+      const resetMatch = sentEmails[0].text.match(/mode=reset-password&token=([a-f0-9]+)/i);
+      assert.ok(resetMatch && resetMatch[1]);
+      const rawResetToken = resetMatch[1];
+
+      // Verify reset token stored as hash, never plaintext
+      const storedResetRow = await db.get<{ token_hash: string; used_at: string | null }>(
+        'SELECT token_hash, used_at FROM password_reset_tokens WHERE user_id = ? ORDER BY id DESC LIMIT 1',
+        secRegRes.json!.user.id
+      );
+      assert.ok(storedResetRow);
+      assert.notEqual(storedResetRow.token_hash, rawResetToken);
+      assert.equal(storedResetRow.token_hash, hashSecurityToken(rawResetToken));
+
+      // Invalid reset token rejected
+      const invalidResetValidate = await req('/api/auth/reset-password/validate?token=deadbeef');
+      assert.equal(invalidResetValidate.status, 400);
+      const invalidResetPost = await req('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: 'a'.repeat(64),
+          newPassword: 'ResetPassword123!',
+          confirmPassword: 'ResetPassword123!',
+        }),
+      });
+      assert.equal(invalidResetPost.status, 400);
+
+      // Expired reset token rejected
+      await db.run(
+        'UPDATE password_reset_tokens SET expires_at = ? WHERE token_hash = ?',
+        new Date(Date.now() - 60_000).toISOString(),
+        storedResetRow.token_hash
+      );
+      const expiredResetValidate = await req(`/api/auth/reset-password/validate?token=${rawResetToken}`);
+      assert.equal(expiredResetValidate.status, 400);
+      assert.equal(expiredResetValidate.json!.reason, 'expired');
+      const expiredResetPost = await req('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: rawResetToken,
+          newPassword: 'ResetPassword123!',
+          confirmPassword: 'ResetPassword123!',
+        }),
+      });
+      assert.equal(expiredResetPost.status, 400);
+
+      // Request another valid reset token and complete reset
+      sentEmails.length = 0;
+      const validForgot = await req('/api/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sam.security@novapay-ci.test' }),
+      });
+      assert.equal(validForgot.status, 200);
+      const validResetMatch = sentEmails[0].text.match(/mode=reset-password&token=([a-f0-9]+)/i);
+      assert.ok(validResetMatch && validResetMatch[1]);
+      const validResetToken = validResetMatch[1];
+
+      const checkValidToken = await req(`/api/auth/reset-password/validate?token=${validResetToken}`);
+      assert.equal(checkValidToken.status, 200);
+      assert.equal(checkValidToken.json!.valid, true);
+
+      // Weak password & mismatch rejected on reset
+      const weakResetPost = await req('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: validResetToken,
+          newPassword: 'short',
+          confirmPassword: 'short',
+        }),
+      });
+      assert.equal(weakResetPost.status, 400);
+
+      const mismatchResetPost = await req('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: validResetToken,
+          newPassword: 'ResetPassword123!',
+          confirmPassword: 'MismatchPassword123!',
+        }),
+      });
+      assert.equal(mismatchResetPost.status, 400);
+
+      // Complete password reset -> invalidates existing sessions & sends confirmation email
+      sentEmails.length = 0;
+      const resetOk = await req('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: validResetToken,
+          newPassword: 'ResetPassword123!',
+          confirmPassword: 'ResetPassword123!',
+        }),
+      });
+      assert.equal(resetOk.status, 200);
+      assert.equal(sentEmails.length, 1);
+      assert.equal(sentEmails[0].from, mockFromHeader);
+      assert.equal(capturedTransportOptions.length, 1);
+      assert.match(sentEmails[0].subject, /password was changed/i);
+
+      // Previous active session is now invalidated
+      const preResetMe = await req('/api/auth/me', { headers: authHdr(samToken) });
+      assert.equal(preResetMe.status, 401);
+
+      // Reused reset token rejected
+      const reusedResetPost = await req('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: validResetToken,
+          newPassword: 'AnotherPassword123!',
+          confirmPassword: 'AnotherPassword123!',
+        }),
+      });
+      assert.equal(reusedResetPost.status, 400);
+
+      // Login with new password succeeds
+      const postResetLogin = await req('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sam.security@novapay-ci.test', password: 'ResetPassword123!' }),
+      });
+      assert.equal(postResetLogin.status, 200);
+
+      // Logout-all invalidates session immediately
+      const postResetToken = postResetLogin.json!.token as string;
+      const logoutAllRes = await req('/api/auth/logout-all', {
+        method: 'POST',
+        headers: authHdr(postResetToken),
+      });
+      assert.equal(logoutAllRes.status, 200);
+      const afterLogoutAllMe = await req('/api/auth/me', { headers: authHdr(postResetToken) });
+    assert.equal(afterLogoutAllMe.status, 401);
+
+      // Forgot-password rate limiting check (5 per 15 min -> 6th returns 429)
+      for (let i = 0; i < 2; i++) {
+        await req('/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'nobody.unknown@novapay-ci.test' }),
+        });
+      }
+      const forgotLimited = await req('/api/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'nobody.unknown@novapay-ci.test' }),
+      });
+      assert.equal(forgotLimited.status, 429);
+
+      // Repeated non-destructive schema migration preserves auth token tables & user records
+      const usersCountBefore = await db.get<{ c: number }>('SELECT COUNT(*) AS c FROM users');
+      await runMigrations();
+      const usersCountAfter = await db.get<{ c: number }>('SELECT COUNT(*) AS c FROM users');
+      assert.equal(usersCountAfter?.c, usersCountBefore?.c);
+    } finally {
+      resetEmailSenderForTesting();
+      delete process.env.SMTP_HOST;
+      delete process.env.SMTP_PORT;
+      delete process.env.SMTP_USER;
+      delete process.env.SMTP_PASSWORD;
+      delete process.env.SMTP_FROM;
+    }
 
     // 10. Production Security Audit Regressions
     authAttempts.clear();
