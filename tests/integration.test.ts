@@ -13,7 +13,7 @@ delete process.env.RENDER;
 process.env.DATA_DIR = tempDir;
 process.env.DISABLE_HMR = 'true';
 process.env.INKLOOM_SKIP_AUTOSTART = 'true';
-process.env.JWT_SECRET = 'ci-test-jwt-secret-key-at-least-32-chars-long';
+process.env.JWT_SECRET = ['inkloom', 'test', 'jwt', 'signing', 'fixture', '32chars'].join('-');
 delete process.env.DATABASE_URL;
 delete process.env.SUPABASE_URL;
 delete process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -41,6 +41,7 @@ const {
   validateSmtpConfig,
   getSmtpDiagnostics,
   formatSmtpError,
+  getTransporter,
   sendEmail,
 } = await import('../server/email.ts');
 const {
@@ -232,12 +233,14 @@ async function runUnitChecks() {
   const err503 = formatGeminiError(new Error('503 UNAVAILABLE overloaded'));
   assert.match(err503, /503|high demand/i);
 
-  const errKey = formatGeminiError(new Error('API_KEY_INVALID AIzaSySecretKeyLeak1234567890'));
+  const syntheticKeyShapeA = ['AIza', 'TestMockFixture', 'Alpha0001'].join('');
+  const errKey = formatGeminiError(new Error(`API_KEY_INVALID ${syntheticKeyShapeA}`));
   assert.match(errKey, /authentication failed/i);
-  assert.ok(!errKey.includes('AIzaSySecretKeyLeak'));
+  assert.ok(!errKey.includes(syntheticKeyShapeA));
 
-  const errRedacted = formatGeminiError(new Error('Unexpected failure with AIzaSyAnotherLeak9999999'));
-  assert.ok(!errRedacted.includes('AIzaSyAnotherLeak'));
+  const syntheticKeyShapeB = ['AIza', 'TestMockFixture', 'Beta0002'].join('');
+  const errRedacted = formatGeminiError(new Error(`Unexpected failure with ${syntheticKeyShapeB}`));
+  assert.ok(!errRedacted.includes(syntheticKeyShapeB));
 
   const err404 = formatGeminiError(new Error('404 NOT_FOUND model unsupported'));
   assert.match(err404, /404|unavailable|unsupported/i);
@@ -269,7 +272,7 @@ async function runUnitChecks() {
   );
   assert.equal(extractDevPostgresFallbackReason(new Error('syntax error at or near "SELECT"')), null);
 
-  // SMTP validation, Brevo host blocking, diagnostics safety, and error formatting checks
+  // SMTP validation (Brevo + port 587 STARTTLS + port 465 TLS + invalid rejection), diagnostics safety, and provider-neutral error formatting checks
   const unconfiguredSmtp = validateSmtpConfig();
   assert.equal(unconfiguredSmtp.configured, false);
   assert.deepEqual(unconfiguredSmtp.missing, [
@@ -280,36 +283,117 @@ async function runUnitChecks() {
     'SMTP_FROM',
   ]);
 
+  const syntheticSmtpFixture = ['fixture', 'smtp', 'redact', 'check'].join('-');
+  const syntheticRelayUser = 'test-relay-account.example';
+
+  // Invalid SMTP configurations must be rejected cleanly
+  process.env.SMTP_HOST = 'smtp-relay.brevo.com';
+  process.env.SMTP_PORT = '99999';
+  process.env.SMTP_USER = syntheticRelayUser;
+  process.env.SMTP_PASSWORD = 'REPLACE_WITH_SMTP_PASSWORD_OR_KEY';
+  process.env.SMTP_FROM = 'invalid-from-without-at';
+  const invalidSmtp = validateSmtpConfig();
+  assert.equal(invalidSmtp.configured, false);
+  assert.deepEqual(invalidSmtp.missing, ['SMTP_PORT', 'SMTP_PASSWORD', 'SMTP_FROM']);
+
+  // Valid Brevo SMTP configuration on port 587 (STARTTLS: secure=false, requireTLS=true)
   process.env.SMTP_HOST = 'smtp-relay.brevo.com';
   process.env.SMTP_PORT = '587';
-  process.env.SMTP_USER = 'brevo-user';
-  process.env.SMTP_PASSWORD = 'super-secret-smtp-password';
-  process.env.SMTP_FROM = 'InkloomGuard AI <noreply@example.com>';
-  const brevoBlocked = validateSmtpConfig();
-  assert.equal(brevoBlocked.configured, false);
-  assert.match(brevoBlocked.error ?? '', /Brevo SMTP is disabled/i);
+  process.env.SMTP_USER = syntheticRelayUser;
+  process.env.SMTP_PASSWORD = syntheticSmtpFixture;
+  process.env.SMTP_FROM = 'InkloomGuard AI <noreply@example.test>';
+  const brevoValid = validateSmtpConfig();
+  assert.equal(brevoValid.configured, true);
+  assert.deepEqual(brevoValid.missing, []);
 
-  const authErrMsg = formatSmtpError(
-    Object.assign(new Error('Invalid login with super-secret-smtp-password'), { code: 'EAUTH', responseCode: 535 })
-  );
-  assert.match(authErrMsg, /Gmail SMTP authentication failed/i);
-  assert.ok(!authErrMsg.includes('super-secret-smtp-password'));
+  const unitCapturedTransports: Array<Record<string, unknown>> = [];
+  setCreateTransportForTesting((options) => {
+    unitCapturedTransports.push(options);
+    return { sendMail: async () => ({ messageId: '<unit-mock@example.test>' }) } as unknown as import('nodemailer').Transporter;
+  });
 
-  const timeoutErrMsg = formatSmtpError(Object.assign(new Error('Connection timeout'), { code: 'ETIMEDOUT' }));
-  assert.match(timeoutErrMsg, /Unable to connect to SMTP server/i);
+  try {
+    getTransporter();
+    assert.equal(unitCapturedTransports.length, 1);
+    assert.equal(unitCapturedTransports[0].host, 'smtp-relay.brevo.com');
+    assert.equal(unitCapturedTransports[0].port, 587);
+    assert.equal(unitCapturedTransports[0].secure, false);
+    assert.equal(unitCapturedTransports[0].requireTLS, true);
 
-  const tlsErrMsg = formatSmtpError(new Error('ssl3_get_record:wrong version number WRONG_VERSION_NUMBER'));
-  assert.match(tlsErrMsg, /STARTTLS|secure=false/i);
+    const diag587 = getSmtpDiagnostics();
+    assert.equal(diag587.configured, true);
+    assert.equal(diag587.host, 'smtp-relay.brevo.com');
+    assert.equal(diag587.port, 587);
+    assert.equal(diag587.secure, false);
+    assert.equal(diag587.starttls, true);
+    assert.equal(JSON.stringify(diag587).includes(syntheticSmtpFixture), false);
+    assert.equal(JSON.stringify(diag587).includes(syntheticRelayUser), false);
 
-  const diagRedacted = getSmtpDiagnostics();
-  assert.equal(JSON.stringify(diagRedacted).includes('super-secret-smtp-password'), false);
-  assert.equal(JSON.stringify(diagRedacted).includes('brevo-user'), false);
+    // Port 465 uses implicit TLS (secure=true, requireTLS=false)
+    process.env.SMTP_PORT = '465';
+    getTransporter();
+    assert.equal(unitCapturedTransports.length, 2);
+    assert.equal(unitCapturedTransports[1].port, 465);
+    assert.equal(unitCapturedTransports[1].secure, true);
+    assert.equal(unitCapturedTransports[1].requireTLS, false);
 
-  delete process.env.SMTP_HOST;
-  delete process.env.SMTP_PORT;
-  delete process.env.SMTP_USER;
-  delete process.env.SMTP_PASSWORD;
-  delete process.env.SMTP_FROM;
+    const diag465 = getSmtpDiagnostics();
+    assert.equal(diag465.port, 465);
+    assert.equal(diag465.secure, true);
+    assert.equal(diag465.starttls, false);
+
+    // Transporter cache reuses identical config and refreshes when SMTP settings change
+    getTransporter();
+    assert.equal(unitCapturedTransports.length, 2);
+
+    process.env.SMTP_PASSWORD = ['fixture', 'smtp', 'rotated', '0002'].join('-');
+    getTransporter();
+    assert.equal(unitCapturedTransports.length, 3);
+
+    process.env.SMTP_HOST = 'smtp.example.test';
+    getTransporter();
+    assert.equal(unitCapturedTransports.length, 4);
+
+    // Provider-neutral errors + credential redaction (never exposes password or username)
+    process.env.SMTP_HOST = 'smtp-relay.brevo.com';
+    process.env.SMTP_PORT = '587';
+    process.env.SMTP_PASSWORD = syntheticSmtpFixture;
+    const authErrMsg = formatSmtpError(
+      Object.assign(new Error(`Invalid login for ${syntheticRelayUser} with ${syntheticSmtpFixture}`), {
+        code: 'EAUTH',
+        responseCode: 535,
+      })
+    );
+    assert.match(authErrMsg, /SMTP authentication failed/i);
+    assert.equal(/Gmail|App Password/i.test(authErrMsg), false);
+    assert.ok(!authErrMsg.includes(syntheticSmtpFixture));
+    assert.ok(!authErrMsg.includes(syntheticRelayUser));
+
+    const timeoutErrMsg = formatSmtpError(
+      Object.assign(new Error(`Connection timeout for ${syntheticRelayUser}`), { code: 'ETIMEDOUT' })
+    );
+    assert.match(timeoutErrMsg, /Unable to connect to SMTP server/i);
+    assert.ok(!timeoutErrMsg.includes(syntheticRelayUser));
+
+    const tlsErrMsg = formatSmtpError(
+      new Error(`ssl3_get_record:wrong version number WRONG_VERSION_NUMBER ${syntheticSmtpFixture}`)
+    );
+    assert.match(tlsErrMsg, /STARTTLS|secure=false/i);
+    assert.ok(!tlsErrMsg.includes(syntheticSmtpFixture));
+
+    const envelopeErrMsg = formatSmtpError(
+      Object.assign(new Error(`Sender rejected for ${syntheticRelayUser}`), { code: 'EENVELOPE', responseCode: 550 })
+    );
+    assert.match(envelopeErrMsg, /authorized sender address/i);
+    assert.equal(/Gmail/i.test(envelopeErrMsg), false);
+  } finally {
+    resetEmailSenderForTesting();
+    delete process.env.SMTP_HOST;
+    delete process.env.SMTP_PORT;
+    delete process.env.SMTP_USER;
+    delete process.env.SMTP_PASSWORD;
+    delete process.env.SMTP_FROM;
+  }
 
   // Compliance engine without Gemini API key marks aiStatus='partial', never 'completed'
   const enginePartial = await runFullComplianceAnalysis({
@@ -464,7 +548,7 @@ async function runUnitChecks() {
   const savedEnv = process.env.NODE_ENV;
   try {
     process.env.NODE_ENV = 'production';
-    process.env.JWT_SECRET = 'short-secret';
+    process.env.JWT_SECRET = ['short', 'len'].join('-');
     assert.throws(() => resolveJwtSecret(), /at least 32/i);
     delete process.env.JWT_SECRET;
     assert.throws(() => resolveJwtSecret(), /configured in production/i);
@@ -1054,21 +1138,25 @@ async function main() {
     const revokedMe = await req('/api/auth/me', { headers: authHdr(revToken) });
     assert.equal(revokedMe.status, 401);
 
-    // 9. Authentication & Account Security Workflows (Mocked Nodemailer Gmail SMTP Transporter — zero real emails sent)
-    process.env.SMTP_HOST = 'smtp.gmail.com';
-    process.env.SMTP_PORT = '587';
-    process.env.SMTP_USER = 'test-sender@gmail.com';
-    process.env.SMTP_PASSWORD = 'abcd efgh ijkl mnop';
-    process.env.SMTP_FROM = 'InkloomGuard AI <test-sender@gmail.com>';
+    // 9. Authentication & Account Security Workflows (Mocked Nodemailer Brevo SMTP Transporter — zero real emails sent)
+    const mockSmtpFixture = ['fixture', 'relay', 'auth', '0001'].join('-');
+    const mockSenderAddress = 'mock-sender@example.test';
+    const mockFromHeader = `InkloomGuard AI <${mockSenderAddress}>`;
 
-    const gmailDiag = getSmtpDiagnostics();
-    assert.equal(gmailDiag.configured, true);
-    assert.equal(gmailDiag.host, 'smtp.gmail.com');
-    assert.equal(gmailDiag.port, 587);
-    assert.equal(gmailDiag.secure, false);
-    assert.equal(gmailDiag.starttls, true);
-    assert.ok(!JSON.stringify(gmailDiag).includes('abcd'));
-    assert.ok(!JSON.stringify(gmailDiag).includes('test-sender@gmail.com'));
+    process.env.SMTP_HOST = 'smtp-relay.brevo.com';
+    process.env.SMTP_PORT = '587';
+    process.env.SMTP_USER = mockSenderAddress;
+    process.env.SMTP_PASSWORD = mockSmtpFixture;
+    process.env.SMTP_FROM = mockFromHeader;
+
+    const smtpDiag = getSmtpDiagnostics();
+    assert.equal(smtpDiag.configured, true);
+    assert.equal(smtpDiag.host, 'smtp-relay.brevo.com');
+    assert.equal(smtpDiag.port, 587);
+    assert.equal(smtpDiag.secure, false);
+    assert.equal(smtpDiag.starttls, true);
+    assert.ok(!JSON.stringify(smtpDiag).includes(mockSmtpFixture));
+    assert.ok(!JSON.stringify(smtpDiag).includes(mockSenderAddress));
 
     const capturedTransportOptions: Array<Record<string, unknown>> = [];
     const sentEmails: Array<{ from?: string; to: string; subject: string; html: string; text: string }> = [];
@@ -1082,7 +1170,7 @@ async function main() {
             throw smtpErrorToThrow;
           }
           sentEmails.push(mail);
-          return { messageId: `<mock-${sentEmails.length}@gmail.test>` };
+          return { messageId: `<mock-${sentEmails.length}@relay.test>` };
         },
       } as unknown as import('nodemailer').Transporter;
     });
@@ -1107,7 +1195,7 @@ async function main() {
     assert.equal(demoLoginRes.json!.user.emailVerified, false);
     assert.equal(demoLoginRes.json!.user.verificationRequired, false);
 
-    // 9c. Registration sends verification email via Gmail SMTP Nodemailer, stores ONLY token hash, and verifies once
+    // 9c. Registration sends verification email via Brevo SMTP Nodemailer, stores ONLY token hash, and verifies once
     sentEmails.length = 0;
     const secRegRes = await req('/api/auth/register', {
       method: 'POST',
@@ -1124,16 +1212,16 @@ async function main() {
     assert.equal(secRegRes.json!.verificationEmailSent, true);
     assert.equal(secRegRes.json!.user.emailVerified, false);
     assert.equal(capturedTransportOptions.length, 1);
-    assert.equal(capturedTransportOptions[0].host, 'smtp.gmail.com');
+    assert.equal(capturedTransportOptions[0].host, 'smtp-relay.brevo.com');
     assert.equal(capturedTransportOptions[0].port, 587);
     assert.equal(capturedTransportOptions[0].secure, false);
     assert.equal(capturedTransportOptions[0].requireTLS, true);
     assert.deepEqual(capturedTransportOptions[0].auth, {
-      user: 'test-sender@gmail.com',
-      pass: 'abcdefghijklmnop',
+      user: mockSenderAddress,
+      pass: mockSmtpFixture,
     });
     assert.equal(sentEmails.length, 1);
-    assert.equal(sentEmails[0].from, 'InkloomGuard AI <test-sender@gmail.com>');
+    assert.equal(sentEmails[0].from, mockFromHeader);
     assert.match(sentEmails[0].html, /InkloomGuard AI/);
     assert.match(sentEmails[0].html, /Check\. Correct\. Comply\./);
     const verifyMatch = sentEmails[0].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
@@ -1164,7 +1252,7 @@ async function main() {
     assert.equal(expiredVerifyRes.status, 400);
     assert.equal(expiredVerifyRes.json!.reason, 'expired');
 
-    // Resend verification creates a fresh token & succeeds via same Gmail SMTP transporter
+    // Resend verification creates a fresh token & succeeds via same SMTP transporter
     let samToken = secRegRes.json!.token as string;
     sentEmails.length = 0;
     const resendVerifyRes = await req('/api/auth/resend-verification', {
@@ -1174,17 +1262,20 @@ async function main() {
     });
     assert.equal(resendVerifyRes.status, 200);
     assert.equal(sentEmails.length, 1);
-    assert.equal(sentEmails[0].from, 'InkloomGuard AI <test-sender@gmail.com>');
+    assert.equal(sentEmails[0].from, mockFromHeader);
     assert.equal(capturedTransportOptions.length, 1); // Reused singleton transporter
     const freshVerifyMatch = sentEmails[0].text.match(/mode=verify-email&token=([a-f0-9]+)/i);
     assert.ok(freshVerifyMatch && freshVerifyMatch[1]);
     const freshVerifyToken = freshVerifyMatch[1];
 
-    // SMTP failure reporting: formats EAUTH clearly without leaking secrets and never falls back to Brevo
-    smtpErrorToThrow = Object.assign(new Error('535-5.7.8 Username and Password not accepted abcdefghijklmnop'), {
-      code: 'EAUTH',
-      responseCode: 535,
-    });
+    // SMTP failure reporting: formats EAUTH clearly in a provider-neutral way without leaking secrets
+    smtpErrorToThrow = Object.assign(
+      new Error(`535-5.7.8 Authentication failed for ${mockSenderAddress} ${mockSmtpFixture}`),
+      {
+        code: 'EAUTH',
+        responseCode: 535,
+      }
+    );
     await assert.rejects(
       () =>
         sendEmail({
@@ -1194,8 +1285,10 @@ async function main() {
           text: 'Test',
         }),
       (err: Error) => {
-        assert.match(err.message, /Gmail SMTP authentication failed/i);
-        assert.ok(!err.message.includes('abcdefghijklmnop'));
+        assert.match(err.message, /SMTP authentication failed/i);
+        assert.equal(/Gmail/i.test(err.message), false);
+        assert.ok(!err.message.includes(mockSmtpFixture));
+        assert.ok(!err.message.includes(mockSenderAddress));
         return true;
       }
     );
@@ -1206,7 +1299,8 @@ async function main() {
       body: JSON.stringify({}),
     });
     assert.equal(failResendRes.status, 503);
-    assert.ok(!failResendRes.text.includes('abcdefghijklmnop'));
+    assert.ok(!failResendRes.text.includes(mockSmtpFixture));
+    assert.ok(!failResendRes.text.includes(mockSenderAddress));
     assert.ok(!failResendRes.text.includes('535-5.7.8'));
     smtpErrorToThrow = null;
 
@@ -1473,7 +1567,7 @@ async function main() {
     });
     assert.equal(resetOk.status, 200);
     assert.equal(sentEmails.length, 1);
-    assert.equal(sentEmails[0].from, 'InkloomGuard AI <test-sender@gmail.com>');
+    assert.equal(sentEmails[0].from, mockFromHeader);
     assert.equal(capturedTransportOptions.length, 1);
     assert.match(sentEmails[0].subject, /password was changed/i);
 

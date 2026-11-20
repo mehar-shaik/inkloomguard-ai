@@ -22,7 +22,6 @@ export interface SmtpDiagnostics {
   starttls: boolean;
   missing: string[];
   error?: string;
-  legacyBrevoEnvPresent: boolean;
 }
 
 export type EmailSenderFn = (message: EmailMessage) => Promise<void>;
@@ -50,10 +49,6 @@ export function resetEmailSenderForTesting(): void {
   cachedTransporterKey = '';
 }
 
-function isDisallowedBrevoHost(host: string): boolean {
-  return /\b(brevo\.com|sendinblue\.com)\b/i.test(host);
-}
-
 function isPlaceholderValue(value: string): boolean {
   return /^REPLACE_WITH_/i.test(value) || /^YOUR_/i.test(value);
 }
@@ -63,14 +58,12 @@ function getSmtpSettings() {
   const portRaw = process.env.SMTP_PORT?.trim() || '';
   const port = portRaw ? Number(portRaw) : NaN;
   const user = process.env.SMTP_USER?.trim() || '';
-  const rawPassword = (process.env.SMTP_PASSWORD ?? '').trim();
-  // Google displays 16-char Gmail App Passwords in 4-char space-separated groups; strip whitespace for Gmail SMTP AUTH
-  const password = host.toLowerCase() === 'smtp.gmail.com' ? rawPassword.replace(/\s+/g, '') : rawPassword;
+  const password = (process.env.SMTP_PASSWORD ?? '').trim();
   const from = process.env.SMTP_FROM?.trim() || '';
 
   // Port 587 uses STARTTLS (secure=false, requireTLS=true). Port 465 uses implicit TLS (secure=true).
   const secure = port === 465 ? true : port === 587 ? false : process.env.SMTP_SECURE === 'true';
-  const requireTLS = !secure && (port === 587 || host.toLowerCase() === 'smtp.gmail.com');
+  const requireTLS = !secure && port === 587;
 
   return { host, port, portRaw, user, password, from, secure, requireTLS };
 }
@@ -96,14 +89,6 @@ export function validateSmtpConfig(): SmtpConfigStatus {
     };
   }
 
-  if (isDisallowedBrevoHost(host)) {
-    return {
-      configured: false,
-      missing: [],
-      error: 'Brevo SMTP is disabled. Configure Gmail SMTP with SMTP_HOST=smtp.gmail.com and SMTP_PORT=587.',
-    };
-  }
-
   return {
     configured: true,
     missing: [],
@@ -117,11 +102,6 @@ export function isSmtpConfigured(): boolean {
 export function getSmtpDiagnostics(): SmtpDiagnostics {
   const { host, port, secure, requireTLS } = getSmtpSettings();
   const status = validateSmtpConfig();
-  const legacyBrevoEnvPresent = Boolean(
-    process.env.BREVO_API_KEY?.trim() ||
-      process.env.SENDINBLUE_API_KEY?.trim() ||
-      process.env.BREVO_SMTP_KEY?.trim()
-  );
 
   return {
     configured: status.configured,
@@ -131,7 +111,6 @@ export function getSmtpDiagnostics(): SmtpDiagnostics {
     starttls: requireTLS,
     missing: status.missing,
     error: status.error,
-    legacyBrevoEnvPresent,
   };
 }
 
@@ -146,15 +125,10 @@ export function logSmtpStartupDiagnostics(): void {
       `[InkloomGuard AI] Email transport inactive (host=${diag.host || 'unset'}, port=${diag.port ?? 'unset'}): ${diag.error}`
     );
   }
-  if (diag.legacyBrevoEnvPresent) {
-    console.warn(
-      '[InkloomGuard AI] Legacy Brevo environment variable detected; Brevo integration is disabled. Remove unused Brevo variables from deployment settings.'
-    );
-  }
 }
 
 export function formatSmtpError(err: unknown): string {
-  const { host, port, password } = getSmtpSettings();
+  const { host, port, user, password } = getSmtpSettings();
   const errObj = (err && typeof err === 'object' ? err : {}) as {
     code?: unknown;
     responseCode?: unknown;
@@ -168,22 +142,21 @@ export function formatSmtpError(err: unknown): string {
   if (password) {
     rawMessage = rawMessage.split(password).join('[REDACTED]');
   }
-
-  if (/Brevo SMTP is disabled/i.test(rawMessage)) {
-    return rawMessage;
+  if (user) {
+    rawMessage = rawMessage.split(user).join('[REDACTED]');
   }
 
   if (
     code === 'EAUTH' ||
     responseCode === 535 ||
     responseCode === 534 ||
-    /Username and Password not accepted|Application-specific password required|Invalid login/i.test(rawMessage)
+    /Username and Password not accepted|Authentication failed|Invalid login/i.test(rawMessage)
   ) {
-    return 'Gmail SMTP authentication failed (535/EAUTH). Verify SMTP_USER and ensure SMTP_PASSWORD is a valid 16-character Google App Password (with 2-Step Verification enabled).';
+    return 'SMTP authentication failed (535/EAUTH). Verify SMTP_USER and SMTP_PASSWORD for your configured SMTP provider.';
   }
 
   if (/WRONG_VERSION_NUMBER|TLS|SSL|certificate/i.test(rawMessage)) {
-    return `SMTP TLS/STARTTLS negotiation failed on ${host || 'unset'}:${port || 'unset'}. For Gmail SMTP port 587, use secure=false with STARTTLS.`;
+    return `SMTP TLS/STARTTLS negotiation failed on ${host || 'unset'}:${port || 'unset'}. For port 587 use STARTTLS (secure=false), or use port 465 for implicit TLS.`;
   }
 
   if (
@@ -195,11 +168,11 @@ export function formatSmtpError(err: unknown): string {
     code === 'EAI_AGAIN' ||
     /timeout|ECONNREFUSED|ENOTFOUND|ETIMEDOUT/i.test(rawMessage)
   ) {
-    return `Unable to connect to SMTP server ${host || 'unset'}:${port || 'unset'} (${code || 'network error'}). Check SMTP_HOST=smtp.gmail.com, SMTP_PORT=587, and outbound network access.`;
+    return `Unable to connect to SMTP server ${host || 'unset'}:${port || 'unset'} (${code || 'network error'}). Check SMTP_HOST, SMTP_PORT, and outbound network access.`;
   }
 
   if (code === 'EENVELOPE' || responseCode === 550 || responseCode === 553 || responseCode === 554) {
-    return 'SMTP server rejected the sender or recipient address. Ensure SMTP_FROM uses your authenticated Gmail address or a verified Gmail Send-As alias.';
+    return 'SMTP server rejected the sender or recipient address. Ensure SMTP_FROM uses an authorized sender address for your SMTP provider.';
   }
 
   return `SMTP delivery error (${code || responseCode || 'transport'}): ${rawMessage}`;
