@@ -1,0 +1,6 @@
+{
+  "name": "InkloomGuard AI",
+  "description": "AI-Powered Brand Compliance & Governance Platform with deterministic rule validation, Gemini multimodal analysis, and human review workflows.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
