@@ -2,7 +2,14 @@ import crypto from 'node:crypto';
 import express from 'express';
 import multer from 'multer';
 import path from 'node:path';
-import { db, DB_ENGINE, checkDatabaseHealth, isProductionEnvironment, isMigrationsReady } from './db.ts';
+import {
+  db,
+  DB_ENGINE,
+  checkDatabaseHealth,
+  isProductionEnvironment,
+  isMigrationsReady,
+  isDemoLoginEnabled,
+} from './db.ts';
 import {
   requireAuth,
   requireVerifiedEmail,
@@ -11,6 +18,9 @@ import {
   registerAccount,
   createTeamMember,
   authenticateAccount,
+  authenticateDemoAccount,
+  getDemoWorkspaceAvailability,
+  DemoAccountUnavailableError,
   signToken,
   clearLegacyAuthCookie,
   revokeTokenFromRequest,
@@ -770,6 +780,7 @@ export function createApiRouter(): express.Router {
       const apiKey = process.env.GEMINI_API_KEY;
       const geminiConfigured = Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY');
       const storage = getStorageStatus();
+      const demo = await getDemoWorkspaceAvailability();
       res.json({
         status: 'ok',
         database: 'connected',
@@ -780,7 +791,10 @@ export function createApiRouter(): express.Router {
         storageBucket: storage.bucket,
         geminiConfigured,
         emailConfigured: isEmailConfigured(),
-        demoAvailable: !isProductionEnvironment(),
+        demoAvailable: demo.available,
+        demoStatus: demo.status,
+        demoOrganizationName: demo.organizationName,
+        ...(demo.message ? { demoMessage: demo.message } : {}),
         timestamp: new Date().toISOString(),
       });
     })
@@ -902,12 +916,12 @@ export function createApiRouter(): express.Router {
     '/auth/demo',
     authRateLimit,
     asyncHandler(async (req, res) => {
-      if (isProductionEnvironment()) {
+      if (!isDemoLoginEnabled()) {
         res.status(404).json({ error: 'Not found.' });
         return;
       }
       try {
-        const user = await authenticateAccount('elena@aetherflow.io', 'Inkloom2026!');
+        const user = await authenticateDemoAccount();
         const token = signToken(user);
         await recordUserSession({
           userId: user.id,
@@ -919,7 +933,15 @@ export function createApiRouter(): express.Router {
         clearLegacyAuthCookie(res);
         res.json({ user, token });
       } catch (err) {
-        console.error('[InkloomGuard AI] Demo login error:', err);
+        if (err instanceof DemoAccountUnavailableError) {
+          res.status(err.statusCode).json({ error: err.message, code: err.code });
+          return;
+        }
+        if (err instanceof AuthenticationError) {
+          res.status(err.statusCode).json({ error: err.message });
+          return;
+        }
+        console.error('[InkloomGuard AI] Demo login error:', err instanceof Error ? err.message : 'Unknown error');
         res.status(500).json({ error: 'Demo login unavailable.' });
       }
     })

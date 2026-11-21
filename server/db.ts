@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Pool, types } from 'pg';
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 
 // Parse PostgreSQL BIGINT (OID 20) safely as JS Number within safe integer bounds
@@ -190,6 +191,33 @@ export function isMigrationsReady(): boolean {
 
 export function isProductionEnvironment(): boolean {
   return process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
+}
+
+export const DEFAULT_DEMO_ORG_NAME = 'AetherFlow Systems';
+export const DEFAULT_DEMO_USER_EMAIL = 'elena@aetherflow.io';
+
+export function getDemoOrganizationName(): string {
+  return process.env.DEMO_ORG_NAME?.trim() || DEFAULT_DEMO_ORG_NAME;
+}
+
+export function getDemoUserEmail(): string {
+  return (process.env.DEMO_USER_EMAIL?.trim() || DEFAULT_DEMO_USER_EMAIL).toLowerCase();
+}
+
+export function isDemoLoginEnabled(): boolean {
+  const flag = process.env.ENABLE_DEMO_LOGIN?.trim().toLowerCase();
+  if (isProductionEnvironment()) {
+    return flag === 'true';
+  }
+  return flag !== 'false';
+}
+
+export function shouldSeedDemoWorkspaceInProduction(): boolean {
+  return (
+    isProductionEnvironment() &&
+    isDemoLoginEnabled() &&
+    process.env.SEED_DEMO_WORKSPACE?.trim().toLowerCase() === 'true'
+  );
 }
 
 const rawDatabaseUrl = process.env.DATABASE_URL?.trim();
@@ -1181,7 +1209,9 @@ export async function initDatabase(): Promise<void> {
   await db.run('DELETE FROM revoked_tokens WHERE expires_at > 0 AND expires_at < ?', nowEpoch);
 
   if (!isProductionEnvironment()) {
-    await seedInitialWorkspace();
+    await ensureDemoWorkspaceSeeded({ allowInProduction: false, onlyWhenEmpty: true });
+  } else if (shouldSeedDemoWorkspaceInProduction()) {
+    await ensureDemoWorkspaceSeeded({ allowInProduction: true, onlyWhenEmpty: false });
   }
   initialized = true;
 }
@@ -1201,145 +1231,255 @@ export async function closeDatabase(): Promise<void> {
   await db.close();
 }
 
-async function seedInitialWorkspace(): Promise<void> {
-  if (isProductionEnvironment()) return;
+export interface DemoSeedResult {
+  seeded: boolean;
+  alreadyExists: boolean;
+  companyId?: number;
+  userId?: number;
+}
 
-  const existing = await db.get<{ cnt: number | string }>('SELECT CAST(COUNT(*) AS INTEGER) AS cnt FROM companies');
-  if (Number(existing?.cnt ?? 0) > 0) return;
+export async function ensureDemoWorkspaceSeeded(options?: {
+  allowInProduction?: boolean;
+  onlyWhenEmpty?: boolean;
+}): Promise<DemoSeedResult> {
+  const allowInProduction = options?.allowInProduction ?? false;
+  const onlyWhenEmpty = options?.onlyWhenEmpty ?? !allowInProduction;
 
-  const companyId = await db.insert('INSERT INTO companies (name) VALUES (?)', 'AetherFlow Systems');
+  if (isProductionEnvironment() && !allowInProduction) {
+    return { seeded: false, alreadyExists: false };
+  }
 
-  const hash = await bcrypt.hash('Inkloom2026!', 10);
-  const userId = await db.insert(
-    'INSERT INTO users (company_id, name, email, password_hash, role) VALUES (?, ?, ?, ?, ?)',
-    companyId,
-    'Elena Vance',
-    'elena@aetherflow.io',
-    hash,
-    'reviewer'
+  const demoOrgName = getDemoOrganizationName();
+  const demoUserEmail = getDemoUserEmail();
+
+  const existingDemoUser = await db.get<{ id: number; company_id: number }>(
+    'SELECT id, company_id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1',
+    demoUserEmail
   );
+  if (existingDemoUser) {
+    return {
+      seeded: false,
+      alreadyExists: true,
+      companyId: Number(existingDemoUser.company_id),
+      userId: Number(existingDemoUser.id),
+    };
+  }
 
-  const brandId = await db.insert(
-    'INSERT INTO brands (company_id, name, industry, primary_color, secondary_color, logo_filename, logo_original_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    companyId,
-    'AetherFlow Cloud',
-    'Enterprise Infrastructure',
-    '#4F46E5',
-    '#06B6D4',
-    null,
-    'aetherflow_mark.png'
-  );
+  if (onlyWhenEmpty) {
+    const existing = await db.get<{ cnt: number | string }>('SELECT CAST(COUNT(*) AS INTEGER) AS cnt FROM companies');
+    if (Number(existing?.cnt ?? 0) > 0) {
+      return { seeded: false, alreadyExists: false };
+    }
+  }
 
-  await db.insert(
-    'INSERT INTO brand_rules (company_id, brand_id, tone_rules, messaging_rules) VALUES (?, ?, ?, ?)',
-    companyId,
-    brandId,
-    'Authoritative, crisp, transparent, and technically precise. Avoid hype, exclamation-heavy sales language, or unverified absolutes. Speak directly to engineering and security leaders.',
-    'Always position AetherFlow Cloud as an enterprise-grade observability and workflow orchestration platform. Emphasize verifiable uptime, SOC 2 Type II compliance, and deterministic auditing.'
-  );
+  // Hash password outside the transaction to avoid holding a DB connection during bcrypt work
+  const configuredPassword = process.env.DEMO_USER_PASSWORD?.trim();
+  const demoPassword =
+    configuredPassword ||
+    (isProductionEnvironment() ? crypto.randomBytes(32).toString('hex') : 'Inkloom2026!');
+  const hash = await bcrypt.hash(demoPassword, 10);
 
-  const factSql = 'INSERT INTO approved_facts (company_id, brand_id, fact_key, fact_value, source_doc) VALUES (?, ?, ?, ?, ?)';
-  await db.insert(factSql, companyId, brandId, 'SLA Uptime', '99.95% contractual uptime SLA', 'AetherFlow Brand & Fact Sheet');
-  await db.insert(factSql, companyId, brandId, 'Compliance Certification', 'SOC 2 Type II and ISO 27001 certified', 'AetherFlow Brand & Fact Sheet');
-  await db.insert(factSql, companyId, brandId, 'Founded Year', 'Founded in 2021 in Seattle, Washington', 'AetherFlow Brand & Fact Sheet');
+  try {
+    return await db.transaction(async (tx): Promise<DemoSeedResult> => {
+      const txExistingUser = await tx.get<{ id: number; company_id: number }>(
+        'SELECT id, company_id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1',
+        demoUserEmail
+      );
+      if (txExistingUser) {
+        return {
+          seeded: false,
+          alreadyExists: true,
+          companyId: Number(txExistingUser.company_id),
+          userId: Number(txExistingUser.id),
+        };
+      }
 
-  const termSql =
-    'INSERT INTO terminology_rules (company_id, brand_id, prohibited_term, preferred_term, severity, notes) VALUES (?, ?, ?, ?, ?, ?)';
-  await db.insert(termSql, companyId, brandId, 'cheap', 'cost-effective', 'medium', 'Never describe enterprise infrastructure as cheap');
-  await db.insert(termSql, companyId, brandId, 'unbreakable', 'resilient', 'high', 'Avoid absolute security promises');
-  await db.insert(termSql, companyId, brandId, 'Aetherflow', 'AetherFlow', 'high', 'Capitalize F in AetherFlow');
-  await db.insert(termSql, companyId, brandId, '100% uptime', '99.95% contractual uptime SLA', 'critical', 'Must match verified SLA figure');
+      if (onlyWhenEmpty) {
+        const txCount = await tx.get<{ cnt: number | string }>('SELECT CAST(COUNT(*) AS INTEGER) AS cnt FROM companies');
+        if (Number(txCount?.cnt ?? 0) > 0) {
+          return { seeded: false, alreadyExists: false };
+        }
+      }
 
-  const sampleOriginal = `# Q4 Enterprise Infrastructure Brief\n\nAetherflow delivers cheap, unbreakable cloud orchestration with 100% uptime guaranteed for every global team.\n\nWe are the #1 best platform in the world for zero-risk deployments!`;
-  const sampleChecks = JSON.stringify([
-    { area: 'Brand Tone', status: 'issues_found', summary: 'Overly promotional exclamation and hype language conflicts with calm, authoritative tone rules.' },
-    { area: 'Terminology', status: 'issues_found', summary: '3 prohibited or mis-cased terms detected via deterministic rule matching.' },
-    { area: 'Brand Messaging', status: 'issues_found', summary: 'Missing approved positioning around observability and deterministic auditing.' },
-    { area: 'Facts', status: 'issues_found', summary: 'Claimed "100% uptime" contradicts approved fact "99.95% contractual uptime SLA".' },
-    { area: 'Promotional Claims', status: 'issues_found', summary: 'Unsupported superlatives "#1 best platform in the world" and "guaranteed" flagged.' },
-    { area: 'Visual Identity', status: 'not_performed', summary: 'Not performed — text-only submission with no image asset attached.' },
-    { area: 'Accessibility', status: 'passed', summary: 'Single H1 heading present and concise sentence structure.' },
-    { area: 'Governance', status: 'warning', summary: 'Awaiting human reviewer decision after compliance scan.' },
-  ]);
+      const existingCompany = await tx.get<{ id: number }>(
+        'SELECT id FROM companies WHERE LOWER(name) = LOWER(?) ORDER BY id ASC LIMIT 1',
+        demoOrgName
+      );
 
-  const subId = await db.insert(
-    `INSERT INTO submissions (
-      company_id, brand_id, submitted_by, title, input_type, original_content, revised_content,
-      status, compliance_score, ai_status, checks_summary_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    companyId,
-    brandId,
-    userId,
-    'Q4 Enterprise Launch Brief',
-    'text',
-    sampleOriginal,
-    sampleOriginal,
-    'pending_review',
-    38,
-    'completed',
-    sampleChecks
-  );
+      let companyId: number;
+      if (existingCompany) {
+        const existingUsersInCompany = await tx.get<{ cnt: number | string }>(
+          'SELECT CAST(COUNT(*) AS INTEGER) AS cnt FROM users WHERE company_id = ?',
+          Number(existingCompany.id)
+        );
+        if (Number(existingUsersInCompany?.cnt ?? 0) > 0) {
+          console.warn(
+            `[InkloomGuard AI] Skipped demo seeding: an existing organization named "${demoOrgName}" already has users.`
+          );
+          return { seeded: false, alreadyExists: false };
+        }
+        companyId = Number(existingCompany.id);
+      } else {
+        companyId = await tx.insert('INSERT INTO companies (name) VALUES (?)', demoOrgName);
+      }
 
-  const issueSql = `INSERT INTO compliance_issues (
-    company_id, submission_id, category, severity, original_text, explanation, evidence, suggested_correction, resolution_status
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      const userId = await tx.insert(
+        'INSERT INTO users (company_id, name, email, password_hash, role) VALUES (?, ?, ?, ?, ?)',
+        companyId,
+        'Elena Vance',
+        demoUserEmail,
+        hash,
+        'reviewer'
+      );
 
-  await db.insert(
-    issueSql,
-    companyId,
-    subId,
-    'Terminology',
-    'high',
-    'Aetherflow',
-    'Brand name casing must preserve internal camelCase capitalization.',
-    'Terminology Rule: Prohibited "Aetherflow" -> Preferred "AetherFlow" (Capitalize F in AetherFlow)',
-    'AetherFlow',
-    'open'
-  );
-  await db.insert(
-    issueSql,
-    companyId,
-    subId,
-    'Terminology',
-    'medium',
-    'cheap',
-    'Using "cheap" undermines enterprise positioning and violates approved terminology.',
-    'Terminology Rule: Prohibited "cheap" -> Preferred "cost-effective"',
-    'cost-effective',
-    'open'
-  );
-  await db.insert(
-    issueSql,
-    companyId,
-    subId,
-    'Facts',
-    'critical',
-    '100% uptime',
-    'Claimed uptime figure contradicts the verified contractual SLA documented in company facts.',
-    'Approved Fact [SLA Uptime]: "99.95% contractual uptime SLA"',
-    '99.95% contractual uptime SLA',
-    'open'
-  );
-  await db.insert(
-    issueSql,
-    companyId,
-    subId,
-    'Promotional Claims',
-    'high',
-    '#1 best platform in the world for zero-risk deployments!',
-    'Unsupported superlative and absolute risk claim cannot be substantiated by approved facts.',
-    'Brand Tone Rule: "Avoid hype, exclamation-heavy sales language, or unverified absolutes."',
-    'an enterprise-grade orchestration platform built for deterministic auditing.',
-    'open'
-  );
+      const existingBrands = await tx.get<{ cnt: number | string }>(
+        'SELECT CAST(COUNT(*) AS INTEGER) AS cnt FROM brands WHERE company_id = ?',
+        companyId
+      );
+      if (Number(existingBrands?.cnt ?? 0) > 0) {
+        return { seeded: true, alreadyExists: false, companyId, userId };
+      }
 
-  await db.insert(
-    'INSERT INTO review_events (company_id, submission_id, reviewer_id, reviewer_name, decision, comment) VALUES (?, ?, ?, ?, ?, ?)',
-    companyId,
-    subId,
-    userId,
-    'Elena Vance',
-    'submitted',
-    'Initial compliance scan completed across 8 brand governance areas.'
-  );
+      const brandId = await tx.insert(
+        'INSERT INTO brands (company_id, name, industry, primary_color, secondary_color, logo_filename, logo_original_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        companyId,
+        'AetherFlow Cloud',
+        'Enterprise Infrastructure',
+        '#4F46E5',
+        '#06B6D4',
+        null,
+        'aetherflow_mark.png'
+      );
+
+      await tx.insert(
+        'INSERT INTO brand_rules (company_id, brand_id, tone_rules, messaging_rules) VALUES (?, ?, ?, ?)',
+        companyId,
+        brandId,
+        'Authoritative, crisp, transparent, and technically precise. Avoid hype, exclamation-heavy sales language, or unverified absolutes. Speak directly to engineering and security leaders.',
+        'Always position AetherFlow Cloud as an enterprise-grade observability and workflow orchestration platform. Emphasize verifiable uptime, SOC 2 Type II compliance, and deterministic auditing.'
+      );
+
+      const factSql = 'INSERT INTO approved_facts (company_id, brand_id, fact_key, fact_value, source_doc) VALUES (?, ?, ?, ?, ?)';
+      await tx.insert(factSql, companyId, brandId, 'SLA Uptime', '99.95% contractual uptime SLA', 'AetherFlow Brand & Fact Sheet');
+      await tx.insert(factSql, companyId, brandId, 'Compliance Certification', 'SOC 2 Type II and ISO 27001 certified', 'AetherFlow Brand & Fact Sheet');
+      await tx.insert(factSql, companyId, brandId, 'Founded Year', 'Founded in 2021 in Seattle, Washington', 'AetherFlow Brand & Fact Sheet');
+
+      const termSql =
+        'INSERT INTO terminology_rules (company_id, brand_id, prohibited_term, preferred_term, severity, notes) VALUES (?, ?, ?, ?, ?, ?)';
+      await tx.insert(termSql, companyId, brandId, 'cheap', 'cost-effective', 'medium', 'Never describe enterprise infrastructure as cheap');
+      await tx.insert(termSql, companyId, brandId, 'unbreakable', 'resilient', 'high', 'Avoid absolute security promises');
+      await tx.insert(termSql, companyId, brandId, 'Aetherflow', 'AetherFlow', 'high', 'Capitalize F in AetherFlow');
+      await tx.insert(termSql, companyId, brandId, '100% uptime', '99.95% contractual uptime SLA', 'critical', 'Must match verified SLA figure');
+
+      const sampleOriginal = `# Q4 Enterprise Infrastructure Brief\n\nAetherflow delivers cheap, unbreakable cloud orchestration with 100% uptime guaranteed for every global team.\n\nWe are the #1 best platform in the world for zero-risk deployments!`;
+      const sampleChecks = JSON.stringify([
+        { area: 'Brand Tone', status: 'issues_found', summary: 'Overly promotional exclamation and hype language conflicts with calm, authoritative tone rules.' },
+        { area: 'Terminology', status: 'issues_found', summary: '3 prohibited or mis-cased terms detected via deterministic rule matching.' },
+        { area: 'Brand Messaging', status: 'issues_found', summary: 'Missing approved positioning around observability and deterministic auditing.' },
+        { area: 'Facts', status: 'issues_found', summary: 'Claimed "100% uptime" contradicts approved fact "99.95% contractual uptime SLA".' },
+        { area: 'Promotional Claims', status: 'issues_found', summary: 'Unsupported superlatives "#1 best platform in the world" and "guaranteed" flagged.' },
+        { area: 'Visual Identity', status: 'not_performed', summary: 'Not performed — text-only submission with no image asset attached.' },
+        { area: 'Accessibility', status: 'passed', summary: 'Single H1 heading present and concise sentence structure.' },
+        { area: 'Governance', status: 'warning', summary: 'Awaiting human reviewer decision after compliance scan.' },
+      ]);
+
+      const subId = await tx.insert(
+        `INSERT INTO submissions (
+          company_id, brand_id, submitted_by, title, input_type, original_content, revised_content,
+          status, compliance_score, ai_status, checks_summary_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        companyId,
+        brandId,
+        userId,
+        'Q4 Enterprise Launch Brief',
+        'text',
+        sampleOriginal,
+        sampleOriginal,
+        'pending_review',
+        38,
+        'completed',
+        sampleChecks
+      );
+
+      const issueSql = `INSERT INTO compliance_issues (
+        company_id, submission_id, category, severity, original_text, explanation, evidence, suggested_correction, resolution_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+      await tx.insert(
+        issueSql,
+        companyId,
+        subId,
+        'Terminology',
+        'high',
+        'Aetherflow',
+        'Brand name casing must preserve internal camelCase capitalization.',
+        'Terminology Rule: Prohibited "Aetherflow" -> Preferred "AetherFlow" (Capitalize F in AetherFlow)',
+        'AetherFlow',
+        'open'
+      );
+      await tx.insert(
+        issueSql,
+        companyId,
+        subId,
+        'Terminology',
+        'medium',
+        'cheap',
+        'Using "cheap" undermines enterprise positioning and violates approved terminology.',
+        'Terminology Rule: Prohibited "cheap" -> Preferred "cost-effective"',
+        'cost-effective',
+        'open'
+      );
+      await tx.insert(
+        issueSql,
+        companyId,
+        subId,
+        'Facts',
+        'critical',
+        '100% uptime',
+        'Claimed uptime figure contradicts the verified contractual SLA documented in company facts.',
+        'Approved Fact [SLA Uptime]: "99.95% contractual uptime SLA"',
+        '99.95% contractual uptime SLA',
+        'open'
+      );
+      await tx.insert(
+        issueSql,
+        companyId,
+        subId,
+        'Promotional Claims',
+        'high',
+        '#1 best platform in the world for zero-risk deployments!',
+        'Unsupported superlative and absolute risk claim cannot be substantiated by approved facts.',
+        'Brand Tone Rule: "Avoid hype, exclamation-heavy sales language, or unverified absolutes."',
+        'an enterprise-grade orchestration platform built for deterministic auditing.',
+        'open'
+      );
+
+      await tx.insert(
+        'INSERT INTO review_events (company_id, submission_id, reviewer_id, reviewer_name, decision, comment) VALUES (?, ?, ?, ?, ?, ?)',
+        companyId,
+        subId,
+        userId,
+        'Elena Vance',
+        'submitted',
+        'Initial compliance scan completed across 8 brand governance areas.'
+      );
+
+      return { seeded: true, alreadyExists: false, companyId, userId };
+    });
+  } catch (err) {
+    const code = (err as { code?: string })?.code;
+    if (code === '23505' || code === 'SQLITE_CONSTRAINT_UNIQUE') {
+      const racedUser = await db.get<{ id: number; company_id: number }>(
+        'SELECT id, company_id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1',
+        demoUserEmail
+      );
+      return {
+        seeded: false,
+        alreadyExists: true,
+        companyId: racedUser ? Number(racedUser.company_id) : undefined,
+        userId: racedUser ? Number(racedUser.id) : undefined,
+      };
+    }
+    throw err;
+  }
 }

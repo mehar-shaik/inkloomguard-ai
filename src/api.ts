@@ -211,6 +211,9 @@ export const api = {
     request<{
       status: string;
       demoAvailable?: boolean;
+      demoStatus?: 'available' | 'disabled' | 'missing_account';
+      demoOrganizationName?: string;
+      demoMessage?: string;
       emailConfigured?: boolean;
       geminiConfigured?: boolean;
     }>('/api/health'),

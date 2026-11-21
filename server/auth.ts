@@ -4,7 +4,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import { db, DATA_DIR, isProductionEnvironment } from './db.ts';
+import {
+  db,
+  DATA_DIR,
+  isProductionEnvironment,
+  getDemoOrganizationName,
+  getDemoUserEmail,
+  isDemoLoginEnabled,
+} from './db.ts';
 import { getPasswordValidationError } from '../src/utils/password.ts';
 
 export const LEGACY_COOKIE_NAME = 'inkloom_token';
@@ -17,6 +24,15 @@ export class AuthenticationError extends Error {
   constructor(message = 'Invalid email or password.') {
     super(message);
     this.name = 'AuthenticationError';
+  }
+}
+
+export class DemoAccountUnavailableError extends Error {
+  statusCode = 503;
+  code = 'DEMO_ACCOUNT_UNAVAILABLE';
+  constructor(message: string) {
+    super(message);
+    this.name = 'DemoAccountUnavailableError';
   }
 }
 
@@ -869,6 +885,101 @@ export async function authenticateAccount(email: string, password: string): Prom
   const matches = await bcrypt.compare(password, row.password_hash);
   if (!matches) {
     throw new AuthenticationError('Invalid email or password.');
+  }
+
+  return mapAuthUserRow(row);
+}
+
+export interface DemoWorkspaceAvailability {
+  available: boolean;
+  status: 'available' | 'disabled' | 'missing_account';
+  organizationName: string;
+  message?: string;
+}
+
+export async function getDemoWorkspaceAvailability(): Promise<DemoWorkspaceAvailability> {
+  const organizationName = getDemoOrganizationName();
+  if (!isDemoLoginEnabled()) {
+    return {
+      available: false,
+      status: 'disabled',
+      organizationName,
+      message:
+        'Pre-seeded organization sign-in is disabled in this environment. Please sign in with your work email and password or create a new workspace.',
+    };
+  }
+
+  const demoEmail = getDemoUserEmail();
+  const row = await db.get<{ companyName: string }>(
+    `SELECT c.name AS "companyName"
+     FROM users u
+     JOIN companies c ON c.id = u.company_id
+     WHERE LOWER(u.email) = LOWER(?) AND LOWER(c.name) = LOWER(?)
+     LIMIT 1`,
+    demoEmail,
+    organizationName
+  );
+
+  if (!row) {
+    return {
+      available: false,
+      status: 'missing_account',
+      organizationName,
+      message: `Pre-seeded organization (${organizationName}) is not currently provisioned in this environment. Please sign in with your work email and password or create a new workspace.`,
+    };
+  }
+
+  return {
+    available: true,
+    status: 'available',
+    organizationName: row.companyName,
+  };
+}
+
+export async function authenticateDemoAccount(): Promise<AuthUser> {
+  const organizationName = getDemoOrganizationName();
+  const demoEmail = getDemoUserEmail();
+
+  const row = await db.get<RawUserRow & { password_hash: string }>(
+    `SELECT
+       u.id,
+       u.company_id AS "companyId",
+       c.name AS "companyName",
+       u.name,
+       u.email,
+       u.role,
+       u.avatar_filename AS "avatarFilename",
+       u.avatar_original_name AS "avatarOriginalName",
+       u.job_title AS "jobTitle",
+       u.bio AS "bio",
+       u.preferences_json AS "preferencesJson",
+       u.email_verified AS "emailVerified",
+       u.email_verified_at AS "emailVerifiedAt",
+       u.verification_required AS "verificationRequired",
+       u.password_updated_at AS "passwordUpdatedAt",
+       u.created_at AS "createdAt",
+       u.token_version AS "tokenVersion",
+       u.password_hash
+     FROM users u
+     JOIN companies c ON c.id = u.company_id
+     WHERE LOWER(u.email) = LOWER(?) AND LOWER(c.name) = LOWER(?)
+     LIMIT 1`,
+    demoEmail,
+    organizationName
+  );
+
+  if (!row) {
+    throw new DemoAccountUnavailableError(
+      `Pre-seeded organization (${organizationName}) is not provisioned in this environment. Please sign in with your work email and password.`
+    );
+  }
+
+  const configuredPassword = process.env.DEMO_USER_PASSWORD?.trim();
+  if (configuredPassword) {
+    const matches = await bcrypt.compare(configuredPassword, row.password_hash);
+    if (!matches) {
+      throw new AuthenticationError('Demo organization sign-in is temporarily unavailable.');
+    }
   }
 
   return mapAuthUserRow(row);

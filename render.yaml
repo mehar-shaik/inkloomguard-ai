@@ -35,3 +35,7 @@ services:
         sync: false
       - key: BREVO_SENDER_NAME
         value: InkloomGuard AI
+      - key: ENABLE_DEMO_LOGIN
+        value: "true"
+      - key: SEED_DEMO_WORKSPACE
+        value: "true"

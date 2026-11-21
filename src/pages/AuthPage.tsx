@@ -5,7 +5,8 @@ import { ThemeToggle } from '../components/ClayUI';
 import { PasswordField } from '../components/PasswordField';
 import { evaluatePasswordStrength } from '../utils/password';
 import {
-  fetchDemoAvailability,
+  DEFAULT_DEMO_ORG_LABEL,
+  fetchDemoAvailabilityDetails,
   isDemoLoginVisible,
   type DemoAvailabilityStatus,
 } from '../utils/demoLogin';
@@ -38,12 +39,16 @@ export function AuthPage({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [demoStatus, setDemoStatus] = useState<DemoAvailabilityStatus>('loading');
+  const [demoOrgName, setDemoOrgName] = useState<string>(DEFAULT_DEMO_ORG_LABEL);
+  const [demoNotice, setDemoNotice] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
-    void fetchDemoAvailability(() => api.getHealth()).then((status) => {
+    void fetchDemoAvailabilityDetails(() => api.getHealth()).then((details) => {
       if (active) {
-        setDemoStatus(status);
+        setDemoStatus(details.status);
+        setDemoOrgName(details.organizationName);
+        setDemoNotice(details.message);
       }
     });
     return () => {
@@ -348,8 +353,19 @@ export function AuthPage({
                 className="clay-btn-secondary w-full rounded-full py-3 px-5 text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
               >
                 <Shield className="w-4 h-4 text-indigo-600 dark:text-violet-300" />
-                Sign In to Pre-Seeded Organization (AetherFlow Systems)
+                Sign In to Pre-Seeded Organization ({demoOrgName})
               </button>
+            </div>
+          )}
+
+          {demoStatus !== 'loading' && !isDemoLoginVisible(demoStatus) && demoNotice && (
+            <div
+              role="status"
+              className="mt-6 pt-5 border-t border-slate-200/80 dark:border-violet-400/20"
+            >
+              <p className="text-xs text-center text-slate-500 dark:text-slate-400 leading-relaxed">
+                {demoNotice}
+              </p>
             </div>
           )}
         </section>

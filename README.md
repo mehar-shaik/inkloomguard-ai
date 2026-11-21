@@ -268,10 +268,10 @@ The **Governance Analytics** workspace aggregates persisted audit data into six 
 
 | Method | Endpoint | Auth | Role | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
-| `GET` | `/api/health` | Public | Any | Health check (`status`, `database`, `engine`, `storage`, `emailConfigured`, `geminiConfigured`, `demoAvailable`) |
+| `GET` | `/api/health` | Public | Any | Health check (`status`, `database`, `engine`, `storage`, `emailConfigured`, `geminiConfigured`, `demoAvailable`, `demoStatus`) |
 | `POST` | `/api/auth/register` | Public | Any | Create organization + initial user; sends verification email; returns `{ user, token }` |
 | `POST` | `/api/auth/login` | Public | Any | Authenticate email/password & create tracked session; returns `{ user, token }` |
-| `POST` | `/api/auth/demo` | Public (non-prod only) | Any | Sign in to seeded `AetherFlow Systems` workspace (`404` in production) |
+| `POST` | `/api/auth/demo` | Public (opt-in in prod) | Any | Sign in to pre-seeded `AetherFlow Systems` workspace (`404` in production unless `ENABLE_DEMO_LOGIN=true`; `503` if demo account is unprovisioned) |
 | `POST` | `/api/auth/logout` | Optional Bearer | Any | Revoke current JWT `jti` in `revoked_tokens` and `user_sessions` |
 | `POST` | `/api/auth/logout-all` | Bearer | Any | Increment `token_version` and revoke all active sessions for caller |
 | `GET` | `/api/auth/me` | Bearer | Any | Verify token and return `{ user }` |
@@ -495,6 +495,8 @@ Add these secrets privately in **Render → Environment** (never commit them):
 - `BREVO_SENDER_EMAIL=<verified-sender@your-domain>`
 - `BREVO_SENDER_NAME=InkloomGuard AI`
 - `CORS_ORIGINS=https://<your-render-service>.onrender.com` (update right after Render assigns your live URL)
+- `ENABLE_DEMO_LOGIN=true` (optional; set to `true` to enable **Sign In to Pre-Seeded Organization (AetherFlow Systems)** in production; defaults to disabled in production when unset)
+- `SEED_DEMO_WORKSPACE=true` (optional; set alongside `ENABLE_DEMO_LOGIN=true` to idempotently provision `AetherFlow Systems` once on startup with zero duplicates, or run `npm run db:seed:demo` from the CLI)
 
 ### Step 8: Set Up GitHub Actions
 1. `.github/workflows/ci.yml` runs automatically on every push and pull request to `main`:
@@ -507,7 +509,7 @@ Add these secrets privately in **Render → Environment** (never commit them):
 ### Step 9: Deploy and Verify the Live Application
 1. Trigger your initial deploy on Render.
 2. Visit `https://<your-render-service>.onrender.com/api/health` and verify JSON output:
-   `{"status":"ok","database":"connected","engine":"postgres","storage":"supabase","geminiConfigured":true,"emailConfigured":true,"demoAvailable":false}`
+   `{"status":"ok","database":"connected","engine":"postgres","storage":"supabase","geminiConfigured":true,"emailConfigured":true,"demoAvailable":true,"demoStatus":"available","demoOrganizationName":"AetherFlow Systems"}` (or `"demoAvailable":false` when `ENABLE_DEMO_LOGIN` is not enabled).
 3. Confirm `CORS_ORIGINS` matches your live Render URL and run the Section 34 persistence verification procedure below.
 
 ### Step 10: Back Up and Restore Application Data
@@ -562,7 +564,7 @@ Run these steps against your live deployed URL `https://<your-app>.onrender.com`
 
 ## 35. Sample Test Organization and Brand
 
-- **Pre-seeded Demo Organization (Non-Production Only)**: `AetherFlow Systems` (created automatically only in non-production environments when `companies` is empty; accessible via **Sign In to Pre-Seeded Organization**).
+- **Pre-seeded Demo Organization**: `AetherFlow Systems` (created automatically in non-production when `companies` is empty; in production, enabled when `ENABLE_DEMO_LOGIN=true` and provisioned idempotently via `SEED_DEMO_WORKSPACE=true` or `npm run db:seed:demo`, accessible via **Sign In to Pre-Seeded Organization (AetherFlow Systems)**).
 - **Recommended Verification Org**: `xyz` with brand `NovaPay` (`#4338CA` primary, `#06B6D4` secondary) and both `reviewer` and `author` accounts.
 
 ## 36. Troubleshooting

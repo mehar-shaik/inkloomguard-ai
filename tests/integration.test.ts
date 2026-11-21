@@ -4253,7 +4253,9 @@ async function main() {
       // 19i. Production demo-login visibility gated strictly on GET /api/health demoAvailable === true
       const {
         fetchDemoAvailability,
+        fetchDemoAvailabilityDetails,
         isDemoLoginVisible,
+        parseDemoAvailabilityDetails,
         parseDemoAvailabilityFromHealth,
       } = await import('../src/utils/demoLogin.ts');
 
@@ -4271,14 +4273,31 @@ async function main() {
       assert.equal(parseDemoAvailabilityFromHealth(null), 'unavailable');
       assert.equal(isDemoLoginVisible('unavailable'), false);
 
-      // Hidden when the health check fails / rejects
+      // Clear explanatory message when unavailable or health request fails
+      const unavailableDetails = parseDemoAvailabilityDetails({
+        status: 'ok',
+        demoAvailable: false,
+        demoMessage: 'Pre-seeded organization sign-in is disabled in this environment.',
+      });
+      assert.equal(unavailableDetails.status, 'unavailable');
+      assert.equal(
+        unavailableDetails.message,
+        'Pre-seeded organization sign-in is disabled in this environment.'
+      );
+
+      // Hidden when the health check fails / rejects, with clear message
       const failedDemoStatus = await fetchDemoAvailability(async () => {
         throw new Error('Network unreachable');
       });
       assert.equal(failedDemoStatus, 'error');
       assert.equal(isDemoLoginVisible(failedDemoStatus), false);
+      const failedDetails = await fetchDemoAvailabilityDetails(async () => {
+        throw new Error('Network unreachable');
+      });
+      assert.equal(failedDetails.status, 'error');
+      assert.ok(failedDetails.message && failedDetails.message.length > 20);
 
-      // Live /api/health integration: visible in non-production, hidden in production
+      // Live /api/health integration: visible in non-production, hidden in production unless explicitly enabled
       const devDemoStatus = await fetchDemoAvailability(async () => {
         const res = await req('/api/health');
         assert.equal(res.status, 200);
@@ -4288,28 +4307,37 @@ async function main() {
       assert.equal(isDemoLoginVisible(devDemoStatus), true);
 
       const savedNodeEnv = process.env.NODE_ENV;
+      const savedEnableDemo = process.env.ENABLE_DEMO_LOGIN;
       try {
         process.env.NODE_ENV = 'production';
-        const prodDemoStatus = await fetchDemoAvailability(async () => {
+        delete process.env.ENABLE_DEMO_LOGIN;
+        const prodDisabledDetails = await fetchDemoAvailabilityDetails(async () => {
           const res = await req('/api/health');
           assert.equal(res.status, 200);
           return res.json;
         });
-        assert.equal(prodDemoStatus, 'unavailable');
-        assert.equal(isDemoLoginVisible(prodDemoStatus), false);
+        assert.equal(prodDisabledDetails.status, 'unavailable');
+        assert.equal(isDemoLoginVisible(prodDisabledDetails.status), false);
+        assert.match(prodDisabledDetails.message || '', /disabled|sign in/i);
       } finally {
         process.env.NODE_ENV = savedNodeEnv;
+        if (savedEnableDemo === undefined) {
+          delete process.env.ENABLE_DEMO_LOGIN;
+        } else {
+          process.env.ENABLE_DEMO_LOGIN = savedEnableDemo;
+        }
       }
 
-      // AuthPage wires demo visibility strictly to GET /api/health helper (no import.meta.env shortcut)
+      // AuthPage wires demo visibility strictly to GET /api/health helper (no import.meta.env shortcut, no credentials)
       const authPageSource = fs.readFileSync(
         path.resolve(process.cwd(), 'src', 'pages', 'AuthPage.tsx'),
         'utf-8'
       );
       assert.match(authPageSource, /useState<DemoAvailabilityStatus>\('loading'\)/);
-      assert.match(authPageSource, /fetchDemoAvailability\(\(\)\s*=>\s*api\.getHealth\(\)\)/);
+      assert.match(authPageSource, /fetchDemoAvailabilityDetails\(\(\)\s*=>\s*api\.getHealth\(\)\)/);
       assert.match(authPageSource, /isDemoLoginVisible\(demoStatus\)/);
       assert.doesNotMatch(authPageSource, /import\.meta\.env/);
+      assert.doesNotMatch(authPageSource, /Inkloom2026!|elena@aetherflow\.io/);
 
       // 19j. PostgreSQL GENERATED ALWAYS AS IDENTITY migration inserts & parameter mapping
       const migrationModule = await import('../scripts/migrate-sqlite-to-postgres.ts');
@@ -4611,6 +4639,170 @@ async function main() {
       const routesSource = fs.readFileSync(path.resolve(process.cwd(), 'server', 'routes.ts'), 'utf-8');
       assert.doesNotMatch(routesSource, /res\.status\(\d+\)\.json\(\{\s*error:\s*err\s+instanceof\s+Error\s*\?\s*err\.message/s);
       assert.doesNotMatch(routesSource, /res\.status\(statusCode\)\.json\(\{\s*error:\s*err\s+instanceof\s+Error\s*\?\s*err\.message/s);
+
+      // 19l. Production Render Pre-Seeded Organization (AetherFlow Systems) sign-in, missing-account handling & idempotency
+      {
+        const { ensureDemoWorkspaceSeeded } = await import('../server/db.ts');
+        const prevEnvNode = process.env.NODE_ENV;
+        const prevEnvRender = process.env.RENDER;
+        const prevEnvEnableDemo = process.env.ENABLE_DEMO_LOGIN;
+        const prevEnvDemoEmail = process.env.DEMO_USER_EMAIL;
+
+        try {
+          process.env.NODE_ENV = 'production';
+          process.env.RENDER = 'true';
+          process.env.ENABLE_DEMO_LOGIN = 'true';
+          delete process.env.DEMO_USER_EMAIL;
+          authAttempts.clear();
+
+          // 1) When enabled and AetherFlow Systems exists in DB -> health reports available & POST /api/auth/demo signs in cleanly
+          const prodEnabledHealth = await req('/api/health');
+          assert.equal(prodEnabledHealth.status, 200);
+          assert.equal(prodEnabledHealth.json?.demoAvailable, true);
+          assert.equal(prodEnabledHealth.json?.demoStatus, 'available');
+          assert.equal(prodEnabledHealth.json?.demoOrganizationName, 'AetherFlow Systems');
+          assert.equal(prodEnabledHealth.json?.demoMessage, undefined);
+
+          const prodDemoSignIn = await req('/api/auth/demo', { method: 'POST' });
+          assert.equal(prodDemoSignIn.status, 200);
+          assert.ok(typeof prodDemoSignIn.json?.token === 'string' && prodDemoSignIn.json.token.length > 20);
+          assert.equal(
+            (prodDemoSignIn.json?.user as { companyName?: string })?.companyName,
+            'AetherFlow Systems'
+          );
+
+          // Verified session works on /api/auth/me in production and is strictly scoped to AetherFlow Systems as reviewer (never admin)
+          const demoToken = String(prodDemoSignIn.json?.token);
+          const demoMe = await req('/api/auth/me', {
+            headers: authHdr(demoToken),
+          });
+          assert.equal(demoMe.status, 200);
+          assert.equal((demoMe.json?.user as { companyName?: string })?.companyName, 'AetherFlow Systems');
+          assert.equal((demoMe.json?.user as { role?: string })?.role, 'reviewer');
+
+          // Tenant isolation: demo session cannot see NovaOrg brands or create admin accounts
+          const demoBrandsRes = await req('/api/brands', { headers: authHdr(demoToken) });
+          assert.equal(demoBrandsRes.status, 200);
+          const demoBrandsList = (demoBrandsRes.json?.brands || []) as Array<{ name: string }>;
+          assert.ok(demoBrandsList.every((b) => !/NovaPay/i.test(b.name)));
+
+          const demoCannotCreateAdmin = await req('/api/team/members', {
+            method: 'POST',
+            headers: authHdr(demoToken, { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({
+              name: 'Attempted Escalation',
+              email: 'escalate-demo@aetherflow.io',
+              password: 'Password123!',
+              role: 'admin',
+            }),
+          });
+          assert.equal(demoCannotCreateAdmin.status, 403);
+
+          // Body tampering on POST /api/auth/demo cannot target another org or user
+          const tamperedDemoRes = await req('/api/auth/demo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: 'maya@novapay-ci.test', companyName: 'NovaOrg', role: 'admin' }),
+          });
+          assert.equal(tamperedDemoRes.status, 200);
+          assert.equal(
+            (tamperedDemoRes.json?.user as { companyName?: string })?.companyName,
+            'AetherFlow Systems'
+          );
+          assert.equal((tamperedDemoRes.json?.user as { email?: string })?.email, 'elena@aetherflow.io');
+          assert.equal((tamperedDemoRes.json?.user as { role?: string })?.role, 'reviewer');
+
+          // Normal email/password login continues working in production
+          const normalLoginProd = await req('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              email: 'maya@novapay-ci.test',
+              password: 'Password123!',
+            }),
+          });
+          assert.equal(normalLoginProd.status, 200);
+          assert.ok(normalLoginProd.json?.token);
+
+          // 2) When enabled in production, but demo account is missing from DB -> clear unavailable message & 503 (never auto-seeds via HTTP)
+          const companyCountBeforeMissing = await db.get<{ c: number }>(
+            'SELECT CAST(COUNT(*) AS INTEGER) AS c FROM companies'
+          );
+          process.env.DEMO_USER_EMAIL = 'missing-demo-account@aetherflow.io';
+          const missingHealth = await req('/api/health');
+          assert.equal(missingHealth.status, 200);
+          assert.equal(missingHealth.json?.demoAvailable, false);
+          assert.equal(missingHealth.json?.demoStatus, 'missing_account');
+          assert.match(String(missingHealth.json?.demoMessage || ''), /not currently provisioned/i);
+
+          const missingDemoLogin = await req('/api/auth/demo', { method: 'POST' });
+          assert.equal(missingDemoLogin.status, 503);
+          assert.equal(missingDemoLogin.json?.code, 'DEMO_ACCOUNT_UNAVAILABLE');
+          assert.equal(missingDemoLogin.json?.token, undefined);
+
+          const companyCountAfterMissing = await db.get<{ c: number }>(
+            'SELECT CAST(COUNT(*) AS INTEGER) AS c FROM companies'
+          );
+          assert.equal(
+            companyCountAfterMissing?.c,
+            companyCountBeforeMissing?.c,
+            'POST /api/auth/demo must never auto-seed companies via HTTP'
+          );
+
+          // Guard against attaching a demo account to an existing non-empty organization
+          const prevDemoOrgName = process.env.DEMO_ORG_NAME;
+          try {
+            process.env.DEMO_ORG_NAME = 'NovaOrg';
+            process.env.DEMO_USER_EMAIL = 'demo-collision-check@novapay-ci.test';
+            const collisionSeed = await ensureDemoWorkspaceSeeded({
+              allowInProduction: true,
+              onlyWhenEmpty: false,
+            });
+            assert.equal(collisionSeed.seeded, false);
+            assert.equal(collisionSeed.alreadyExists, false);
+            const collidedUser = await db.get(
+              'SELECT id FROM users WHERE LOWER(email) = LOWER(?)',
+              'demo-collision-check@novapay-ci.test'
+            );
+            assert.equal(collidedUser, undefined, 'Must never attach demo user to an existing non-empty organization');
+          } finally {
+            if (prevDemoOrgName === undefined) delete process.env.DEMO_ORG_NAME;
+            else process.env.DEMO_ORG_NAME = prevDemoOrgName;
+          }
+
+          // 3) Idempotency: repeated ensureDemoWorkspaceSeeded calls never create duplicate AetherFlow orgs, users, or brands
+          delete process.env.DEMO_USER_EMAIL;
+          const aetherOrgCountBefore = await db.get<{ c: number }>(
+            "SELECT CAST(COUNT(*) AS INTEGER) AS c FROM companies WHERE LOWER(name) = 'aetherflow systems'"
+          );
+          const aetherUserCountBefore = await db.get<{ c: number }>(
+            "SELECT CAST(COUNT(*) AS INTEGER) AS c FROM users WHERE LOWER(email) = 'elena@aetherflow.io'"
+          );
+          const seed1 = await ensureDemoWorkspaceSeeded({ allowInProduction: true, onlyWhenEmpty: false });
+          const seed2 = await ensureDemoWorkspaceSeeded({ allowInProduction: true, onlyWhenEmpty: false });
+          assert.equal(seed1.seeded, false);
+          assert.equal(seed1.alreadyExists, true);
+          assert.equal(seed2.seeded, false);
+          assert.equal(seed2.alreadyExists, true);
+
+          const aetherOrgCountAfter = await db.get<{ c: number }>(
+            "SELECT CAST(COUNT(*) AS INTEGER) AS c FROM companies WHERE LOWER(name) = 'aetherflow systems'"
+          );
+          const aetherUserCountAfter = await db.get<{ c: number }>(
+            "SELECT CAST(COUNT(*) AS INTEGER) AS c FROM users WHERE LOWER(email) = 'elena@aetherflow.io'"
+          );
+          assert.equal(aetherOrgCountAfter?.c, aetherOrgCountBefore?.c);
+          assert.equal(aetherUserCountAfter?.c, aetherUserCountBefore?.c);
+        } finally {
+          process.env.NODE_ENV = prevEnvNode;
+          if (prevEnvRender === undefined) delete process.env.RENDER;
+          else process.env.RENDER = prevEnvRender;
+          if (prevEnvEnableDemo === undefined) delete process.env.ENABLE_DEMO_LOGIN;
+          else process.env.ENABLE_DEMO_LOGIN = prevEnvEnableDemo;
+          if (prevEnvDemoEmail === undefined) delete process.env.DEMO_USER_EMAIL;
+          else process.env.DEMO_USER_EMAIL = prevEnvDemoEmail;
+        }
+      }
     }
 
     console.log(
